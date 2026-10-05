@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/proxify-core",
+    "crates/proxify-hook",
+    "crates/proxify-cli",
+]
+resolver = "2"
