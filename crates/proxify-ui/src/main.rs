@@ -1,3 +1,6 @@
+// Suppress the console window on Windows release builds
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui;
 use proxify_core::{AppConfig, ProxyConfig, Rule, RuleAction, socks5};
 use std::ffi::OsStr;
