@@ -5,6 +5,19 @@ All notable changes to `proxify-rs` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-10-05
+
+### Added
+- **Intelligent Parent Process Prioritization**:
+  - Automatically identifies the root/main process of multi-process applications (e.g. Firefox, Chrome, Edge, Telegram) by evaluating `ParentProcessId` hierarchy.
+  - Prioritizes attaching to the main parent process first, establishing transparent proxy tunneling on the process that owns the socket stack.
+- **Dedicated "Attach Main Process" Action**:
+  - Live Process Monitor now labels the main process (e.g., `● Main PID: 17744`) and provides a 1-click **`⚡ Attach Main`** action alongside **`⚡ Attach All`**.
+- **Graceful Sandboxed Renderer Handling**:
+  - Recognizes Windows Process Mitigation Policies (such as `BlockLowLabelImageLoads` and `DisableWin32kSystemCalls` in tab content renderers like PID 25368).
+  - Skips sandboxed tab renderers gracefully with informational notes (`ℹ Sandboxed child renderer skipped — network traffic is routed via hooked main process`) instead of confusing error messages.
+  - Batch attach and detach operations report concise and accurate completion summaries.
+
 ## [0.5.0] - 2026-10-05
 
 ### Added

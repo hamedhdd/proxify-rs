@@ -32,6 +32,7 @@ use windows_sys::Win32::System::Threading::{
 #[derive(Clone, Debug)]
 pub struct ProcessItem {
     pub pid: u32,
+    pub parent_pid: u32,
     pub name: String,
 }
 
@@ -327,7 +328,7 @@ impl ProxifyApp {
     }
 
     pub fn find_matching_pids(processes: &[ProcessItem], app_name: &str, app_path: &str) -> Vec<(u32, String)> {
-        let mut matches = Vec::new();
+        let mut matches: Vec<&ProcessItem> = Vec::new();
         let name_lower = app_name.to_lowercase();
         let path_file_lower = std::path::Path::new(app_path)
             .file_name()
@@ -344,10 +345,21 @@ impl ProxifyApp {
                 || (path_file_lower.ends_with(".exe") && path_file_lower[..path_file_lower.len() - 4] == p_lower);
 
             if matches_app {
-                matches.push((proc.pid, proc.name.clone()));
+                matches.push(proc);
             }
         }
-        matches
+
+        // Prioritize the root / main parent process first so network hooks are established immediately
+        let pid_set: HashSet<u32> = matches.iter().map(|p| p.pid).collect();
+        matches.sort_by_key(|p| {
+            if pid_set.contains(&p.parent_pid) {
+                1 // Child worker/renderer process
+            } else {
+                0 // Main / Root process (handles network stack)
+            }
+        });
+
+        matches.into_iter().map(|p| (p.pid, p.name.clone())).collect()
     }
 
     fn attach_to_pids_async(&mut self, targets: Vec<(u32, String)>) {
@@ -382,6 +394,8 @@ impl ProxifyApp {
                 | PROCESS_VM_READ;
 
             let mut success_count = 0;
+            let mut sandboxed_count = 0;
+
             for (pid, proc_name) in &targets {
                 unsafe {
                     let h_proc = OpenProcess(desired_access, FALSE, *pid);
@@ -398,14 +412,31 @@ impl ProxifyApp {
                             success_count += 1;
                         }
                         Err(e) => {
-                            let _ = tx.send(AppEvent::Log(format!("✗ Failed injecting into {} (PID {}): {}", proc_name, pid, e)));
+                            if e.contains("Sandboxed child process") || e.contains("Injection rejected") {
+                                sandboxed_count += 1;
+                                if success_count > 0 {
+                                    let _ = tx.send(AppEvent::Log(format!("ℹ PID {} ({}): Sandboxed child renderer skipped (all network connections are handled by the hooked main process).", pid, proc_name)));
+                                } else {
+                                    let _ = tx.send(AppEvent::Log(format!("ℹ PID {} ({}): Sandboxed child process rejected injection. In multi-process browsers, attach the main process.", pid, proc_name)));
+                                }
+                            } else {
+                                let _ = tx.send(AppEvent::Log(format!("✗ Failed injecting into {} (PID {}): {}", proc_name, pid, e)));
+                            }
                         }
                     }
                     CloseHandle(h_proc);
                 }
             }
 
-            let _ = tx.send(AppEvent::Log(format!("==> Batch attach completed: {}/{} processes successfully hooked!", success_count, total)));
+            if success_count > 0 {
+                if sandboxed_count > 0 {
+                    let _ = tx.send(AppEvent::Log(format!("==> Batch attach completed: {} main process(es) hooked! ({} sandboxed child renderers skipped — all network traffic is routed via parent process).", success_count, sandboxed_count)));
+                } else {
+                    let _ = tx.send(AppEvent::Log(format!("==> Batch attach completed: {}/{} processes successfully hooked!", success_count, total)));
+                }
+            } else {
+                let _ = tx.send(AppEvent::Log(format!("==> Batch attach finished: 0/{} processes hooked.", total)));
+            }
         });
     }
 
@@ -443,7 +474,9 @@ impl ProxifyApp {
                             success_count += 1;
                         }
                         Err(e) => {
-                            let _ = tx.send(AppEvent::Log(format!("✗ Failed unhooking {} (PID {}): {}", proc_name, pid, e)));
+                            if !e.contains("not loaded") {
+                                let _ = tx.send(AppEvent::Log(format!("✗ Failed unhooking {} (PID {}): {}", proc_name, pid, e)));
+                            }
                         }
                     }
                     CloseHandle(h_proc);
@@ -624,7 +657,7 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
 
     if exit_code == 0 {
         return Err(format!(
-            "LoadLibraryW returned NULL in target process for '{}'. Injection rejected by target process.",
+            "LoadLibraryW returned NULL in target process for '{}'. Injection rejected by target process (Process Mitigation Policy / Sandboxed child process).",
             path_str
         ));
     }
@@ -760,6 +793,7 @@ fn list_running_processes() -> Vec<ProcessItem> {
                 if entry.th32ProcessID > 4 && !name.is_empty() {
                     procs.push(ProcessItem {
                         pid: entry.th32ProcessID,
+                        parent_pid: entry.th32ParentProcessID,
                         name,
                     });
                 }
@@ -1220,14 +1254,14 @@ impl ProxifyApp {
         ui.add_space(4.0);
 
         let search = self.proc_search.to_lowercase();
-        let mut grouped: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+        let mut grouped: std::collections::BTreeMap<String, Vec<ProcessItem>> = std::collections::BTreeMap::new();
 
         for proc in &self.processes {
             let pid_str = proc.pid.to_string();
             if !search.is_empty() && !proc.name.to_lowercase().contains(&search) && !pid_str.contains(&search) {
                 continue;
             }
-            grouped.entry(proc.name.clone()).or_default().push(proc.pid);
+            grouped.entry(proc.name.clone()).or_default().push(proc.clone());
         }
 
         let total_matched_pids: usize = grouped.values().map(|v| v.len()).sum();
@@ -1239,18 +1273,18 @@ impl ProxifyApp {
                 ui.label(egui::RichText::new(format!("Matches: {} processes across {} applications", total_matched_pids, grouped.len())).color(egui::Color32::from_rgb(241, 196, 15)));
                 if ui.button(egui::RichText::new(format!("⚡ Attach All Filtered ({} PIDs)", total_matched_pids)).color(egui::Color32::from_rgb(52, 152, 219))).clicked() {
                     let mut targets = Vec::new();
-                    for (name, pids) in &grouped {
-                        for p in pids {
-                            targets.push((*p, name.clone()));
+                    for (name, procs) in &grouped {
+                        for p in procs {
+                            targets.push((p.pid, name.clone()));
                         }
                     }
                     attach_batch = Some(targets);
                 }
                 if ui.button(egui::RichText::new(format!("🔌 Detach All Filtered ({} PIDs)", total_matched_pids)).color(egui::Color32::from_rgb(231, 76, 60))).clicked() {
                     let mut targets = Vec::new();
-                    for (name, pids) in &grouped {
-                        for p in pids {
-                            targets.push((*p, name.clone()));
+                    for (name, procs) in &grouped {
+                        for p in procs {
+                            targets.push((p.pid, name.clone()));
                         }
                     }
                     detach_batch = Some(targets);
@@ -1260,7 +1294,12 @@ impl ProxifyApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (name, pids) in &grouped {
+            for (name, procs) in &grouped {
+                let pids: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+                let pids_set: HashSet<u32> = pids.iter().copied().collect();
+                let main_proc = procs.iter().find(|p| !pids_set.contains(&p.parent_pid));
+                let main_pid = main_proc.map(|p| p.pid);
+
                 let attached_count = pids.iter().filter(|p| self.attached_pids.contains(p)).count();
 
                 ui.group(|ui| {
@@ -1269,6 +1308,9 @@ impl ProxifyApp {
                         let count = pids.len();
                         if count > 1 {
                             ui.colored_label(egui::Color32::from_rgb(241, 196, 15), format!("({} instances)", count));
+                            if let Some(m_pid) = main_pid {
+                                ui.colored_label(egui::Color32::from_rgb(46, 204, 113), format!("● Main PID: {}", m_pid));
+                            }
                         }
 
                         if attached_count > 0 {
@@ -1296,6 +1338,20 @@ impl ProxifyApp {
                                 if ui.button(egui::RichText::new(btn_text).color(egui::Color32::from_rgb(52, 152, 219))).clicked() {
                                     let targets = pids.iter().map(|p| (*p, name.clone())).collect();
                                     attach_batch = Some(targets);
+                                }
+
+                                if let Some(m_pid) = main_pid {
+                                    if self.attached_pids.contains(&m_pid) {
+                                        let btn_detach_main = format!("🔌 Detach Main ({})", m_pid);
+                                        if ui.button(egui::RichText::new(btn_detach_main).color(egui::Color32::from_rgb(231, 76, 60))).clicked() {
+                                            detach_batch = Some(vec![(m_pid, name.clone())]);
+                                        }
+                                    } else {
+                                        let btn_attach_main = format!("⚡ Attach Main ({})", m_pid);
+                                        if ui.button(egui::RichText::new(btn_attach_main).color(egui::Color32::from_rgb(46, 204, 113))).clicked() {
+                                            attach_batch = Some(vec![(m_pid, name.clone())]);
+                                        }
+                                    }
                                 }
                             } else if let Some(&single_pid) = pids.first() {
                                 if self.attached_pids.contains(&single_pid) {

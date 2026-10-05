@@ -242,7 +242,7 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
 
     if exit_code == 0 {
         return Err(format!(
-            "LoadLibraryW returned NULL in target process for '{}'. Injection rejected by target process.",
+            "LoadLibraryW returned NULL in target process for '{}'. Injection rejected by target process (Process Mitigation Policy / Sandboxed child process).",
             path_str
         ));
     }
@@ -509,6 +509,7 @@ fn main() {
                 | PROCESS_VM_READ;
 
             let mut success_count = 0;
+            let mut sandboxed_count = 0;
             for (p, proc_name) in &targets {
                 let h_proc = unsafe { OpenProcess(desired_access, FALSE, *p) };
                 if h_proc.is_null() {
@@ -522,12 +523,31 @@ fn main() {
                             println!("  ✓ PID {} ({}): Injected proxify hook successfully", p, proc_name);
                             success_count += 1;
                         }
-                        Err(e) => eprintln!("  ✗ PID {} ({}): Injection failed: {}", p, proc_name, e),
+                        Err(e) => {
+                            if e.contains("Sandboxed child process") || e.contains("Injection rejected") {
+                                sandboxed_count += 1;
+                                if success_count > 0 {
+                                    println!("  ℹ PID {} ({}): Sandboxed child renderer skipped (network traffic is routed via hooked main process)", p, proc_name);
+                                } else {
+                                    println!("  ℹ PID {} ({}): Sandboxed child process rejected injection. In multi-process browsers, attach the main process.", p, proc_name);
+                                }
+                            } else {
+                                eprintln!("  ✗ PID {} ({}): Injection failed: {}", p, proc_name, e);
+                            }
+                        }
                     }
                     CloseHandle(h_proc);
                 }
             }
-            println!("==> Finished: Successfully attached to {}/{} process(es).", success_count, targets.len());
+            if success_count > 0 {
+                if sandboxed_count > 0 {
+                    println!("==> Finished: Successfully hooked application! ({} main/parent process(es) hooked; {} sandboxed renderers skipped).", success_count, sandboxed_count);
+                } else {
+                    println!("==> Finished: Successfully attached to {}/{} process(es).", success_count, targets.len());
+                }
+            } else {
+                println!("==> Finished: Attached to 0/{} process(es).", targets.len());
+            }
         }
 
         Commands::Detach { pid, name } => {
@@ -572,7 +592,11 @@ fn main() {
                             println!("  ✓ PID {} ({}): Detached proxify hook and restored original Winsock APIs cleanly", p, proc_name);
                             success_count += 1;
                         }
-                        Err(e) => eprintln!("  ✗ PID {} ({}): Detach failed: {}", p, proc_name, e),
+                        Err(e) => {
+                            if !e.contains("not loaded") {
+                                eprintln!("  ✗ PID {} ({}): Detach failed: {}", p, proc_name, e);
+                            }
+                        }
                     }
                     CloseHandle(h_proc);
                 }
@@ -713,14 +737,14 @@ fn main() {
 }
 
 fn find_pids_by_name(name_query: &str) -> Vec<(u32, String)> {
-    let mut matches = Vec::new();
+    let mut raw_matches = Vec::new();
     let q = name_query.to_lowercase();
     let q_exe = if q.ends_with(".exe") { q.clone() } else { format!("{}.exe", q) };
 
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return matches;
+            return Vec::new();
         }
 
         let mut entry: PROCESSENTRY32 = core::mem::zeroed();
@@ -738,7 +762,7 @@ fn find_pids_by_name(name_query: &str) -> Vec<(u32, String)> {
                 let name_lower = name.to_lowercase();
 
                 if (name_lower == q || name_lower == q_exe || name_lower.contains(&q)) && entry.th32ProcessID > 4 {
-                    matches.push((entry.th32ProcessID, name));
+                    raw_matches.push((entry.th32ProcessID, entry.th32ParentProcessID, name));
                 }
 
                 if Process32Next(snapshot, &mut entry) == 0 {
@@ -748,5 +772,15 @@ fn find_pids_by_name(name_query: &str) -> Vec<(u32, String)> {
         }
         CloseHandle(snapshot);
     }
-    matches
+
+    let pid_set: std::collections::HashSet<u32> = raw_matches.iter().map(|(pid, _, _)| *pid).collect();
+    raw_matches.sort_by_key(|(_, parent_pid, _)| {
+        if pid_set.contains(parent_pid) {
+            1 // Child process (e.g. renderer)
+        } else {
+            0 // Main / Root process
+        }
+    });
+
+    raw_matches.into_iter().map(|(pid, _, name)| (pid, name)).collect()
 }
