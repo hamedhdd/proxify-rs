@@ -637,7 +637,44 @@ fn main() {
                     CloseHandle(h_proc);
                 }
             }
-            println!("==> Finished: Successfully detached from {}/{} process(es).", success_count, targets.len());
+
+            // Mark detached application(s) as disabled in config.json
+            if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+                let dir = PathBuf::from(local_appdata).join("proxify");
+                let cfg_path = dir.join("config.json");
+                if let Ok(content) = fs::read_to_string(&cfg_path) {
+                    if let Ok(mut config) = serde_json::from_str::<ProxyConfig>(&content) {
+                        let mut changed = false;
+                        for (_, proc_name) in &targets {
+                            let p_lower = proc_name.to_lowercase();
+                            for app in &mut config.apps {
+                                let name_lower = app.name.to_lowercase();
+                                let path_lower = app.path.to_lowercase();
+                                if name_lower == p_lower
+                                    || path_lower == p_lower
+                                    || (p_lower.ends_with(".exe") && &p_lower[..p_lower.len() - 4] == name_lower)
+                                {
+                                    if app.enabled {
+                                        app.enabled = false;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        if changed {
+                            if let Ok(json) = serde_json::to_string_pretty(&config) {
+                                let _ = fs::write(&cfg_path, &json);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if success_count > 0 {
+                println!("==> Finished: Successfully detached and unhooked all {} active process instance(s).", success_count);
+            } else {
+                println!("==> Finished: Target process(es) do not have active hooks loaded.");
+            }
         }
 
         Commands::Config { action } => match action {

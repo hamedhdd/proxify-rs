@@ -186,6 +186,14 @@ impl ProxifyApp {
 
     fn refresh_processes(&mut self) {
         self.processes = list_running_processes();
+        // Dynamically detect which processes currently have proxify_hook.dll loaded
+        let mut actual_hooked = HashSet::new();
+        for proc in &self.processes {
+            if unsafe { is_dll_loaded(proc.pid, "proxify_hook.dll") } {
+                actual_hooked.insert(proc.pid);
+            }
+        }
+        self.attached_pids = actual_hooked;
     }
 
     fn test_proxy_connection(&mut self) {
@@ -490,6 +498,7 @@ impl ProxifyApp {
                             success_count += 1;
                         }
                         Err(e) => {
+                            let _ = tx.send(AppEvent::Detached(*pid));
                             if !e.contains("not loaded") {
                                 let _ = tx.send(AppEvent::Log(format!("✗ Failed unhooking {} (PID {}): {}", proc_name, pid, e)));
                             }
@@ -499,11 +508,22 @@ impl ProxifyApp {
                 }
             }
 
-            let _ = tx.send(AppEvent::Log(format!("==> Batch detach completed: {}/{} processes cleanly unhooked!", success_count, total)));
+            if success_count > 0 {
+                let _ = tx.send(AppEvent::Log(format!("==> Batch detach completed: All {} active hook instance(s) cleanly detached and restored!", success_count)));
+            } else {
+                let _ = tx.send(AppEvent::Log("==> Batch detach completed: Target processes are unhooked.".to_string()));
+            }
         });
     }
 
     fn detach_all_attached_pids_sync(&mut self) {
+        // Also scan running processes to catch any process with proxify_hook.dll loaded
+        for proc in list_running_processes() {
+            if unsafe { is_dll_loaded(proc.pid, "proxify_hook.dll") } {
+                self.attached_pids.insert(proc.pid);
+            }
+        }
+
         if self.attached_pids.is_empty() {
             return;
         }
@@ -793,6 +813,50 @@ unsafe fn eject_dll(process_handle: HANDLE, module_name: &str) -> Result<(), Str
     }
 }
 
+unsafe fn is_dll_loaded(pid: u32, module_name: &str) -> bool {
+    let desired_access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
+    let h_proc = OpenProcess(desired_access, 0, pid);
+    if h_proc.is_null() {
+        return false;
+    }
+
+    let mut modules: [HMODULE; 1024] = [core::ptr::null_mut(); 1024];
+    let mut cb_needed: u32 = 0;
+    let ok = EnumProcessModules(
+        h_proc,
+        modules.as_mut_ptr(),
+        (modules.len() * core::mem::size_of::<HMODULE>()) as u32,
+        &mut cb_needed,
+    );
+
+    let mut found = false;
+    if ok != 0 {
+        let count = (cb_needed as usize) / core::mem::size_of::<HMODULE>();
+        let target_name_lower = module_name.to_lowercase();
+        for &h_mod in &modules[..count.min(modules.len())] {
+            if h_mod.is_null() {
+                continue;
+            }
+            let mut name_buf = [0u8; 260];
+            let len = GetModuleBaseNameA(
+                h_proc,
+                h_mod,
+                name_buf.as_mut_ptr(),
+                name_buf.len() as u32,
+            );
+            if len > 0 {
+                let name_str = String::from_utf8_lossy(&name_buf[..len as usize]).to_lowercase();
+                if name_str == target_name_lower {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    CloseHandle(h_proc);
+    found
+}
+
 fn list_running_processes() -> Vec<ProcessItem> {
     let mut procs = Vec::new();
     unsafe {
@@ -835,6 +899,11 @@ fn list_running_processes() -> Vec<ProcessItem> {
 
 impl eframe::App for ProxifyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // If window close is requested (X button / Alt+F4), cleanly and synchronously unhook all target processes
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.detach_all_attached_pids_sync();
+        }
+
         // Drain asynchronous background task events
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
@@ -1016,6 +1085,7 @@ impl ProxifyApp {
         let mut to_launch: Option<(String, String)> = None;
         let mut to_attach_batch: Option<Vec<(u32, String)>> = None;
         let mut to_detach_batch: Option<Vec<(u32, String)>> = None;
+        let mut to_disable_idx: Option<usize> = None;
         let mut to_remove: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1060,6 +1130,7 @@ impl ProxifyApp {
                             if run_count > 0 {
                                 if attached_count > 0 {
                                     if ui.button(egui::RichText::new("🔌 Detach All").color(egui::Color32::from_rgb(231, 76, 60))).clicked() {
+                                        to_disable_idx = Some(idx);
                                         to_detach_batch = Some(running_targets.clone());
                                     }
                                 }
@@ -1078,6 +1149,13 @@ impl ProxifyApp {
                 });
             }
         });
+
+        if let Some(idx) = to_disable_idx {
+            if let Some(app) = self.config.apps.get_mut(idx) {
+                app.enabled = false;
+            }
+            self.save_config();
+        }
 
         if let Some(idx) = to_remove {
             if let Some(app) = self.config.apps.get(idx) {

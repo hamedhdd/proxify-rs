@@ -332,6 +332,10 @@ unsafe fn handle_proxy_connect(
     namelen: i32,
     original_fn: ConnectFn,
 ) -> i32 {
+    if !HOOK_INITIALIZED.load(Ordering::SeqCst) {
+        return original_fn(s, name, namelen);
+    }
+
     if name.is_null() || namelen < core::mem::size_of::<SOCKADDR_IN>() as i32 {
         return original_fn(s, name, namelen);
     }
@@ -404,6 +408,9 @@ unsafe fn handle_proxy_connect(
 
 unsafe extern "system" fn detour_connect(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32 {
     if let Some(&original) = ORIGINAL_CONNECT.get() {
+        if !HOOK_INITIALIZED.load(Ordering::SeqCst) {
+            return original(s, name, namelen);
+        }
         handle_proxy_connect(s, name, namelen, original)
     } else {
         SOCKET_ERROR
@@ -419,6 +426,16 @@ unsafe extern "system" fn detour_wsaconnect(
     lp_sqos: *mut c_void,
     lp_gqos: *mut c_void,
 ) -> i32 {
+    if !HOOK_INITIALIZED.load(Ordering::SeqCst) {
+        if let Some(&original) = ORIGINAL_WSACONNECT.get() {
+            return original(s, name, namelen, lp_caller_data, lp_callee_data, lp_sqos, lp_gqos);
+        } else if let Some(&original_connect) = ORIGINAL_CONNECT.get() {
+            return original_connect(s, name, namelen);
+        } else {
+            return SOCKET_ERROR;
+        }
+    }
+
     if lp_caller_data.is_null() && lp_callee_data.is_null() {
         if let Some(&original_connect) = ORIGINAL_CONNECT.get() {
             return handle_proxy_connect(s, name, namelen, original_connect);

@@ -5,6 +5,21 @@ All notable changes to `proxify-rs` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-10-05
+
+### Fixed
+- **Guaranteed Automatic Clean Unhooking on Window Close**:
+  - Implemented `eframe::App::on_exit` and intercept `close_requested()` viewport events to guarantee all attached target processes are synchronously unhooked and restored when `proxify-ui` closes via the window close button, Alt+F4, or task termination.
+  - Pre-exit cleanup scans all running user processes for active `proxify_hook.dll` modules to ensure no orphaned hooks are left behind.
+- **Dynamic Memory Inspection for Active Hooks (`is_dll_loaded`)**:
+  - `refresh_processes()` dynamically inspects running processes via `EnumProcessModules` to determine whether `proxify_hook.dll` is genuinely resident in memory.
+  - Eliminates state desynchronization between GUI sessions, accurately displaying `● Hooked` or `⚡ Attach` based on ground-truth memory state.
+- **Instant Unhook Bypass Guard in Hook DLL**:
+  - Added atomic `HOOK_INITIALIZED` bypass checks directly inside `detour_connect`, `detour_wsaconnect`, and `handle_proxy_connect`. If unhooking is initiated, traffic immediately bypasses proxy logic and routes through original Winsock APIs.
+- **Accurate Detach Summary & Config Synchronization**:
+  - Clarified batch detach reporting to reflect actual unhooked instances rather than misleading candidate counts (e.g., "All 1 active hook instance(s) cleanly detached" instead of "1/14 cleanly unhooked").
+  - Clicking "Detach All" on an application card automatically updates `enabled = false` and synchronizes to `%LOCALAPPDATA%\proxify\config.json`.
+
 ## [0.5.2] - 2026-10-05
 
 ### Fixed
