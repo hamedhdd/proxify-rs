@@ -376,7 +376,18 @@ impl ProxifyApp {
             }
         };
 
+        // Automatically register newly attached applications in active configuration so their traffic proxies
+        let mut any_added = false;
+        for (_, proc_name) in &targets {
+            if self.config.ensure_app_registered(proc_name) {
+                any_added = true;
+            }
+        }
+        if any_added {
+            self.log("Registered attached application(s) in active configuration.");
+        }
         self.save_config();
+
         let canon_cfg = self.config_path.canonicalize().unwrap_or(self.config_path.clone());
         let cfg_str = canon_cfg.to_str().unwrap_or("").to_string();
         let tx = self.event_tx.clone();
@@ -412,7 +423,12 @@ impl ProxifyApp {
                             success_count += 1;
                         }
                         Err(e) => {
-                            if e.contains("Sandboxed child process") || e.contains("Injection rejected") {
+                            if e.contains("Sandboxed child process")
+                                || e.contains("Injection rejected")
+                                || e.contains("os error 5")
+                                || e.contains("Access is denied")
+                                || e.contains("denied")
+                            {
                                 sandboxed_count += 1;
                                 if success_count > 0 {
                                     let _ = tx.send(AppEvent::Log(format!("ℹ PID {} ({}): Sandboxed child renderer skipped (all network connections are handled by the hooked main process).", pid, proc_name)));
@@ -597,7 +613,11 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
         PAGE_READWRITE,
     );
     if remote_mem.is_null() {
-        return Err(format!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(5) {
+            return Err("Sandboxed child process memory allocation denied (os error 5 / process mitigation active)".to_string());
+        }
+        return Err(format!("VirtualAllocEx failed: {}", err));
     }
 
     let mut written: usize = 0;
@@ -638,8 +658,12 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
         core::ptr::null_mut(),
     );
     if h_thread.is_null() {
+        let err = std::io::Error::last_os_error();
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
-        return Err(format!("CreateRemoteThread failed: {}", std::io::Error::last_os_error()));
+        if err.raw_os_error() == Some(5) {
+            return Err("Sandboxed child process thread creation denied (os error 5 / process mitigation active)".to_string());
+        }
+        return Err(format!("CreateRemoteThread failed: {}", err));
     }
 
     let wait_res = WaitForSingleObject(h_thread, 10000);

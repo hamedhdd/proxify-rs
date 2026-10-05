@@ -139,12 +139,9 @@ impl ProxyConfig {
             return rule.action == RuleAction::Proxy;
         }
 
-        // 2. Check if the application is in the configured enabled apps list
+        // 2. Check if the application is in the configured apps list
         if !app_name.is_empty() {
-            let is_configured_app = self.apps.iter().any(|app| {
-                if !app.enabled {
-                    return false;
-                }
+            let found_app = self.apps.iter().find(|app| {
                 let name_lower = app.name.to_lowercase();
                 let path_file_lower = std::path::Path::new(&app.path)
                     .file_name()
@@ -157,14 +154,51 @@ impl ProxyConfig {
                     || (path_file_lower.ends_with(".exe") && path_file_lower[..path_file_lower.len() - 4] == app_lower)
             });
 
-            if is_configured_app {
-                // By default, applications added to Proxify have their traffic proxied
+            if let Some(app) = found_app {
+                // If explicitly disabled in configured apps, bypass proxy
+                if !app.enabled {
+                    return false;
+                }
+                // If enabled, route through proxy
                 return true;
             }
         }
 
         // 3. Fallback to default action
         self.default_action == RuleAction::Proxy
+    }
+
+    /// Ensures that an application is registered in the apps list and marked enabled.
+    /// Returns true if newly added or enabled.
+    pub fn ensure_app_registered(&mut self, app_name: &str) -> bool {
+        let app_lower = app_name.to_lowercase();
+        for app in &mut self.apps {
+            let name_lower = app.name.to_lowercase();
+            let path_file_lower = std::path::Path::new(&app.path)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_lowercase())
+                .unwrap_or_else(|| app.path.to_lowercase());
+
+            if app_lower == path_file_lower
+                || app_lower == name_lower
+                || (app_lower.ends_with(".exe") && app_lower[..app_lower.len() - 4] == path_file_lower)
+                || (path_file_lower.ends_with(".exe") && path_file_lower[..path_file_lower.len() - 4] == app_lower)
+            {
+                if !app.enabled {
+                    app.enabled = true;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        self.apps.push(AppConfig {
+            name: app_name.to_string(),
+            path: app_name.to_string(),
+            args: String::new(),
+            enabled: true,
+        });
+        true
     }
 
     /// Determines whether the given IP and port should be proxied based on configured rules.
@@ -271,6 +305,19 @@ pub mod socks5 {
         ]
     }
 
+    /// Build SOCKS5 CONNECT request for IPv6.
+    pub fn build_connect_ipv6(ip: [u8; 16], port: u16) -> [u8; 22] {
+        let mut buf = [0u8; 22];
+        buf[0] = SOCKS_VERSION;
+        buf[1] = CMD_CONNECT;
+        buf[2] = 0x00;
+        buf[3] = ATYP_IPV6;
+        buf[4..20].copy_from_slice(&ip);
+        buf[20] = (port >> 8) as u8;
+        buf[21] = (port & 0xFF) as u8;
+        buf
+    }
+
     /// Build SOCKS5 CONNECT request for domain name.
     pub fn build_connect_domain(domain: &str, port: u16) -> Vec<u8> {
         let domain_bytes = domain.as_bytes();
@@ -289,5 +336,49 @@ pub mod socks5 {
     /// Verify SOCKS5 CONNECT response.
     pub fn verify_connect_response(response: &[u8]) -> bool {
         response.len() >= 4 && response[0] == SOCKS_VERSION && response[1] == REP_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_app_registered() {
+        let mut cfg = ProxyConfig::default();
+        assert_eq!(cfg.apps.len(), 1);
+
+        // Add firefox
+        let added = cfg.ensure_app_registered("firefox.exe");
+        assert!(added);
+        assert_eq!(cfg.apps.len(), 2);
+        assert!(cfg.apps.iter().any(|a| a.name == "firefox.exe" && a.enabled));
+
+        // Adding again should not duplicate
+        let added_again = cfg.ensure_app_registered("firefox.exe");
+        assert!(!added_again);
+        assert_eq!(cfg.apps.len(), 2);
+
+        // Disabling it then calling ensure_app_registered should re-enable
+        cfg.apps[1].enabled = false;
+        let re_enabled = cfg.ensure_app_registered("firefox.exe");
+        assert!(re_enabled);
+        assert!(cfg.apps[1].enabled);
+    }
+
+    #[test]
+    fn test_should_proxy_registered_app() {
+        let mut cfg = ProxyConfig::default();
+        cfg.default_action = RuleAction::Direct;
+
+        // Untargeted app with default_action=Direct should not proxy
+        assert!(!cfg.should_proxy("firefox.exe", "103.75.196.241", 5000));
+
+        // Once registered, it should proxy!
+        cfg.ensure_app_registered("firefox.exe");
+        assert!(cfg.should_proxy("firefox.exe", "103.75.196.241", 5000));
+
+        // Localhost bypass rule should still bypass even for registered app
+        assert!(!cfg.should_proxy("firefox.exe", "127.0.0.1", 8080));
     }
 }

@@ -12,12 +12,16 @@
 - **SOCKS5 with RFC 1929 Authentication**: Supports both unauthenticated proxies and username/password credentials in configuration and in-flight handshakes.
 - **Zero Administrator Privileges**: Intercepts applications in user-mode using standard Win32 process spawning and memory injection. No UAC prompts, no driver signing, and no kernel extensions required.
 - **No PowerShell Dependency**: Runs as standalone native binaries (`proxify-ui.exe` and `proxify.exe`) interacting directly with the Windows API (`CreateProcessW`, `LoadLibraryW`, Winsock2).
-- **Rule-Based Routing**:
-  - Direct vs. Proxy rules based on target IPv4 addresses, wildcard prefixes (e.g., `198.51.100.*`), ports, and hostnames.
+- **Rule-Based Routing & Hot Reloading**:
+  - Direct vs. Proxy rules based on target IPv4/IPv6 addresses, wildcard prefixes (e.g., `198.51.100.*`), ports, and hostnames.
   - Automatic loopback bypass to avoid proxy self-loops.
+  - Injected hooks hot-reload configuration changes within 1 second without restarting target applications.
+- **Automatic App Registration**:
+  - Attaching to running processes automatically registers them in the active configuration and enables proxying, preventing accidental direct routing even when `default_action` is `direct`.
 - **Two Operation Modes**:
   - `run`: Spawns a target process suspended, injects the hooking DLL, and resumes it cleanly.
   - `attach`: Attaches to an existing process owned by the current user session and injects the proxy hook.
+
 
 ---
 

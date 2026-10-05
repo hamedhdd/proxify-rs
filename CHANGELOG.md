@@ -5,6 +5,25 @@ All notable changes to `proxify-rs` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-10-05
+
+### Fixed
+- **Automatic App Registration on Attachment**:
+  - When attaching to running processes from the GUI (Live Process Monitor) or CLI (`proxify attach`), Proxify automatically registers the application in `config.apps` with `enabled = true` and persists it to `%LOCALAPPDATA%\proxify\config.json`.
+  - Resolves issue where attached processes routed connections directly (`[DIRECT]`) instead of tunneling through the SOCKS5 proxy when `default_action` was set to `direct`.
+- **Dynamic Configuration Hot-Reloading in Target Processes**:
+  - Replaced one-time `OnceLock<ProxyConfig>` in `proxify_hook.dll` with an adaptive 1-second hot-reloader using `RwLock<CachedConfig>`.
+  - Attached target processes now automatically pick up changes to routing rules, app toggles, and proxy settings in real time without needing re-injection.
+- **Graceful Sandbox DACL & Memory Allocation Handling**:
+  - Properly detects OS error 5 (`Access is denied`) during `VirtualAllocEx` and `CreateRemoteThread` on sandboxed child processes with restricted tokens.
+  - Automatically classifies them as sandboxed child renderers and skips them gracefully with informational notices instead of alarming red error alerts.
+
+### Added
+- **IPv6 SOCKS5 Connect Frame Support**:
+  - Added `socks5::build_connect_ipv6` to construct RFC 1928 IPv6 connection requests (`ATYP_IPV6`).
+- **Unit Test Coverage for Routing & Registration**:
+  - Added automated unit tests verifying `ensure_app_registered` deduplication, state re-enabling, and `should_proxy` evaluation.
+
 ## [0.5.1] - 2026-10-05
 
 ### Added

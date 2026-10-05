@@ -5,7 +5,8 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{BOOL, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
@@ -30,8 +31,38 @@ type WSAConnectFn = unsafe extern "system" fn(
 
 static ORIGINAL_CONNECT: OnceLock<ConnectFn> = OnceLock::new();
 static ORIGINAL_WSACONNECT: OnceLock<WSAConnectFn> = OnceLock::new();
-static CONFIG: OnceLock<ProxyConfig> = OnceLock::new();
+
+struct CachedConfig {
+    config: ProxyConfig,
+    last_checked: Instant,
+}
+
+static CONFIG: OnceLock<RwLock<CachedConfig>> = OnceLock::new();
 static HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+fn get_config() -> ProxyConfig {
+    let rwlock = CONFIG.get_or_init(|| {
+        RwLock::new(CachedConfig {
+            config: load_config(),
+            last_checked: Instant::now(),
+        })
+    });
+
+    // Check if we should re-check/reload config every 1 second
+    if let Ok(mut write_guard) = rwlock.try_write() {
+        if write_guard.last_checked.elapsed().as_millis() >= 1000 {
+            write_guard.last_checked = Instant::now();
+            write_guard.config = load_config();
+        }
+        return write_guard.config.clone();
+    }
+
+    if let Ok(read_guard) = rwlock.read() {
+        read_guard.config.clone()
+    } else {
+        ProxyConfig::default()
+    }
+}
 
 fn chrono_format_now() -> String {
     use std::time::SystemTime;
@@ -318,7 +349,7 @@ unsafe fn handle_proxy_connect(
     let target_ip_str = target_ip.to_string();
 
     let proc_name = get_current_process_name();
-    let cfg = CONFIG.get_or_init(load_config);
+    let cfg = get_config();
 
     if !cfg.should_proxy(&proc_name, &target_ip_str, target_port) {
         log_msg(&format!("[DIRECT] {} -> {}:{}", proc_name, target_ip_str, target_port));
@@ -358,7 +389,7 @@ unsafe fn handle_proxy_connect(
     }
 
     // Now complete SOCKS5 tunnel handshake
-    match perform_socks5_handshake(s, target_ip_bytes, target_port, cfg) {
+    match perform_socks5_handshake(s, target_ip_bytes, target_port, &cfg) {
         Ok(_) => {
             log_msg(&format!("✓ Successfully tunneled {} to {}:{}!", proc_name, target_ip_str, target_port));
             0
@@ -408,7 +439,7 @@ fn initialize_hooks() {
 
     let proc_name = get_current_process_name();
     log_msg(&format!("Initializing Winsock API hooks in process '{}'...", proc_name));
-    let _ = CONFIG.get_or_init(load_config);
+    let _ = get_config();
 
     unsafe {
         // Ensure ws2_32.dll is loaded into the process!

@@ -182,7 +182,11 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
         PAGE_READWRITE,
     );
     if remote_mem.is_null() {
-        return Err(format!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(5) {
+            return Err("Sandboxed child process memory allocation denied (os error 5 / process mitigation active)".to_string());
+        }
+        return Err(format!("VirtualAllocEx failed: {}", err));
     }
 
     let mut written: usize = 0;
@@ -223,8 +227,12 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
         core::ptr::null_mut(),
     );
     if h_thread.is_null() {
+        let err = std::io::Error::last_os_error();
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
-        return Err(format!("CreateRemoteThread failed: {}", std::io::Error::last_os_error()));
+        if err.raw_os_error() == Some(5) {
+            return Err("Sandboxed child process thread creation denied (os error 5 / process mitigation active)".to_string());
+        }
+        return Err(format!("CreateRemoteThread failed: {}", err));
     }
 
     let wait_res = WaitForSingleObject(h_thread, 10000);
@@ -501,6 +509,29 @@ fn main() {
                 }
             };
 
+            // Automatically register target application(s) in active configuration so their network traffic is proxied
+            if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+                let dir = PathBuf::from(local_appdata).join("proxify");
+                let cfg_path = dir.join("config.json");
+                let mut config = if let Ok(content) = fs::read_to_string(&cfg_path) {
+                    serde_json::from_str::<ProxyConfig>(&content).unwrap_or_default()
+                } else {
+                    ProxyConfig::default()
+                };
+                let mut changed = false;
+                for (_, proc_name) in &targets {
+                    if config.ensure_app_registered(proc_name) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(json) = serde_json::to_string_pretty(&config) {
+                        let _ = fs::create_dir_all(&dir);
+                        let _ = fs::write(&cfg_path, &json);
+                    }
+                }
+            }
+
             println!("==> Found {} target process(es) to attach:", targets.len());
             let desired_access = PROCESS_CREATE_THREAD
                 | PROCESS_QUERY_INFORMATION
@@ -524,7 +555,12 @@ fn main() {
                             success_count += 1;
                         }
                         Err(e) => {
-                            if e.contains("Sandboxed child process") || e.contains("Injection rejected") {
+                            if e.contains("Sandboxed child process")
+                                || e.contains("Injection rejected")
+                                || e.contains("os error 5")
+                                || e.contains("Access is denied")
+                                || e.contains("denied")
+                            {
                                 sandboxed_count += 1;
                                 if success_count > 0 {
                                     println!("  ℹ PID {} ({}): Sandboxed child renderer skipped (network traffic is routed via hooked main process)", p, proc_name);
