@@ -150,11 +150,23 @@ impl ProxifyApp {
         });
 
         if let Ok(json) = serde_json::to_string_pretty(&self.config) {
-            if let Err(e) = fs::write(&self.config_path, json) {
-                self.log(&format!("Failed to save config: {}", e));
-            } else {
-                self.log(&format!("Saved configuration to {}", self.config_path.display()));
+            let _ = fs::write(&self.config_path, &json);
+
+            // Save to %LOCALAPPDATA%\proxify\config.json for target processes
+            if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+                let dir = PathBuf::from(&local_appdata).join("proxify");
+                let _ = fs::create_dir_all(&dir);
+                let _ = fs::write(dir.join("config.json"), &json);
             }
+
+            // Save to %APPDATA%\proxify\config.json
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                let dir = PathBuf::from(&appdata).join("proxify");
+                let _ = fs::create_dir_all(&dir);
+                let _ = fs::write(dir.join("config.json"), &json);
+            }
+
+            self.log(&format!("Saved configuration to {} and global AppData.", self.config_path.display()));
         }
     }
 
@@ -386,12 +398,24 @@ fn find_hook_dll() -> Result<PathBuf, String> {
 }
 
 unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), String> {
+    // Check if target is a 32-bit process running under WOW64 on 64-bit Windows
+    let mut is_wow64: windows_sys::Win32::Foundation::BOOL = 0;
+    windows_sys::Win32::System::Threading::IsWow64Process(process_handle, &mut is_wow64);
+    if is_wow64 != 0 {
+        return Err("Target process is 32-bit (x86). 64-bit Proxify cannot inject into 32-bit processes.".to_string());
+    }
+
     let dll_abs_path = dll_path
         .canonicalize()
         .map_err(|e| format!("Failed to canonicalize DLL path: {}", e))?;
 
-    let wide_path: Vec<u16> = dll_abs_path
-        .as_os_str()
+    // Strip verbatim UNC prefix "\\?\" which can cause LoadLibraryW to fail in many apps
+    let mut path_str = dll_abs_path.to_string_lossy().to_string();
+    if path_str.starts_with(r"\\?\") {
+        path_str = path_str[4..].to_string();
+    }
+
+    let wide_path: Vec<u16> = OsStr::new(&path_str)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
@@ -405,7 +429,7 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
         PAGE_READWRITE,
     );
     if remote_mem.is_null() {
-        return Err("VirtualAllocEx failed in target process".to_string());
+        return Err(format!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
     }
 
     let mut written: usize = 0;
@@ -418,7 +442,7 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
     );
     if write_res == 0 || written != wide_path_bytes_len {
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
-        return Err("WriteProcessMemory failed".to_string());
+        return Err(format!("WriteProcessMemory failed: {}", std::io::Error::last_os_error()));
     }
 
     let kernel32_name = b"kernel32.dll\0";
@@ -447,15 +471,27 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
     );
     if h_thread.is_null() {
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
-        return Err("CreateRemoteThread failed".to_string());
+        return Err(format!("CreateRemoteThread failed: {}", std::io::Error::last_os_error()));
     }
 
     let wait_res = WaitForSingleObject(h_thread, 10000);
+    if wait_res == WAIT_FAILED {
+        CloseHandle(h_thread);
+        VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
+        return Err("WaitForSingleObject failed on remote thread".to_string());
+    }
+
+    // Check thread exit code = return value of LoadLibraryW!
+    let mut exit_code: u32 = 0;
+    windows_sys::Win32::System::Threading::GetExitCodeThread(h_thread, &mut exit_code);
     CloseHandle(h_thread);
     VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
 
-    if wait_res == WAIT_FAILED {
-        return Err("WaitForSingleObject failed".to_string());
+    if exit_code == 0 {
+        return Err(format!(
+            "LoadLibraryW returned NULL in target process for '{}'. Injection rejected by target process.",
+            path_str
+        ));
     }
 
     Ok(())
@@ -778,6 +814,7 @@ impl ProxifyApp {
                         self.config.rules.push(Rule {
                             name: self.new_rule_name.trim().to_string(),
                             action: self.new_rule_action,
+                            target_apps: vec![],
                             target_ips: ips,
                             target_ports: ports,
                             target_hosts: hosts,

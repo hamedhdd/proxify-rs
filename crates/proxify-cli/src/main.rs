@@ -131,12 +131,24 @@ fn find_hook_dll(explicit_path: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), String> {
+    // Check if target is a 32-bit process running under WOW64 on 64-bit Windows
+    let mut is_wow64: windows_sys::Win32::Foundation::BOOL = 0;
+    windows_sys::Win32::System::Threading::IsWow64Process(process_handle, &mut is_wow64);
+    if is_wow64 != 0 {
+        return Err("Target process is 32-bit (x86). 64-bit Proxify cannot inject into 32-bit processes.".to_string());
+    }
+
     let dll_abs_path = dll_path
         .canonicalize()
         .map_err(|e| format!("Failed to canonicalize DLL path: {}", e))?;
 
-    let wide_path: Vec<u16> = dll_abs_path
-        .as_os_str()
+    // Strip verbatim UNC prefix "\\?\"
+    let mut path_str = dll_abs_path.to_string_lossy().to_string();
+    if path_str.starts_with(r"\\?\") {
+        path_str = path_str[4..].to_string();
+    }
+
+    let wide_path: Vec<u16> = OsStr::new(&path_str)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
@@ -150,7 +162,7 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
         PAGE_READWRITE,
     );
     if remote_mem.is_null() {
-        return Err("VirtualAllocEx failed in target process memory".to_string());
+        return Err(format!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
     }
 
     let mut written: usize = 0;
@@ -163,7 +175,7 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
     );
     if write_res == 0 || written != wide_path_bytes_len {
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
-        return Err("WriteProcessMemory failed to write DLL path".to_string());
+        return Err(format!("WriteProcessMemory failed: {}", std::io::Error::last_os_error()));
     }
 
     let kernel32_name = b"kernel32.dll\0";
@@ -192,15 +204,27 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
     );
     if h_thread.is_null() {
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
-        return Err("CreateRemoteThread failed in target process".to_string());
+        return Err(format!("CreateRemoteThread failed: {}", std::io::Error::last_os_error()));
     }
 
     let wait_res = WaitForSingleObject(h_thread, 10000);
+    if wait_res == WAIT_FAILED {
+        CloseHandle(h_thread);
+        VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
+        return Err("WaitForSingleObject failed on injection thread".to_string());
+    }
+
+    // Check thread exit code = return value of LoadLibraryW!
+    let mut exit_code: u32 = 0;
+    windows_sys::Win32::System::Threading::GetExitCodeThread(h_thread, &mut exit_code);
     CloseHandle(h_thread);
     VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
 
-    if wait_res == WAIT_FAILED {
-        return Err("WaitForSingleObject failed on injection thread".to_string());
+    if exit_code == 0 {
+        return Err(format!(
+            "LoadLibraryW returned NULL in target process for '{}'. Injection rejected by target process.",
+            path_str
+        ));
     }
 
     Ok(())
@@ -373,6 +397,7 @@ fn main() {
                         Rule {
                             name: "Proxy Specific Corporate Subnet".to_string(),
                             action: RuleAction::Proxy,
+                            target_apps: vec![],
                             target_ips: vec!["198.51.100.*".to_string(), "203.0.113.10".to_string()],
                             target_ports: vec![80, 443, 8080],
                             target_hosts: vec!["*.corp.example.com".to_string()],
@@ -380,6 +405,7 @@ fn main() {
                         Rule {
                             name: "Direct Localhost Bypass".to_string(),
                             action: RuleAction::Direct,
+                            target_apps: vec![],
                             target_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
                             target_ports: vec![],
                             target_hosts: vec!["localhost".to_string()],

@@ -12,6 +12,8 @@ pub struct Rule {
     pub name: String,
     pub action: RuleAction,
     #[serde(default)]
+    pub target_apps: Vec<String>,
+    #[serde(default)]
     pub target_ips: Vec<String>,
     #[serde(default)]
     pub target_ports: Vec<u16>,
@@ -68,6 +70,7 @@ impl Default for ProxyConfig {
                 Rule {
                     name: "Localhost bypass".to_string(),
                     action: RuleAction::Direct,
+                    target_apps: vec![],
                     target_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
                     target_ports: vec![],
                     target_hosts: vec!["localhost".to_string()],
@@ -86,36 +89,87 @@ impl Default for ProxyConfig {
 }
 
 impl ProxyConfig {
-    /// Determines whether the given IP and port should be proxied based on configured rules.
-    pub fn should_proxy_ip(&self, ip_str: &str, port: u16) -> bool {
+    /// Comprehensive evaluation: Checks app name, IP, and port against configured apps, rules, and default action.
+    pub fn should_proxy(&self, app_name: &str, ip_str: &str, port: u16) -> bool {
         // Never proxy loopback connections directly to the proxy itself to prevent loops!
-        if (ip_str == "127.0.0.1" || ip_str == "localhost") && port == self.proxy_port {
+        if (ip_str == "127.0.0.1" || ip_str == "localhost" || ip_str == "::1") && port == self.proxy_port {
             return false;
         }
 
+        let app_lower = app_name.to_lowercase();
+
+        // 1. Check explicit rules in order (first matching rule wins)
         for rule in &self.rules {
-            let port_matches = rule.target_ports.is_empty() || rule.target_ports.contains(&port);
-            if !port_matches {
+            if !rule.target_apps.is_empty() {
+                let app_match = rule.target_apps.iter().any(|target_app| {
+                    if target_app == "*" {
+                        return true;
+                    }
+                    let t_lower = target_app.to_lowercase();
+                    app_lower == t_lower
+                        || (app_lower.ends_with(".exe") && app_lower[..app_lower.len() - 4] == t_lower)
+                        || (t_lower.ends_with(".exe") && t_lower[..t_lower.len() - 4] == app_lower)
+                });
+                if !app_match {
+                    continue;
+                }
+            }
+
+            if !rule.target_ports.is_empty() && !rule.target_ports.contains(&port) {
                 continue;
             }
 
-            let ip_matches = rule.target_ips.iter().any(|rule_ip| {
-                if rule_ip == "*" {
-                    return true;
+            if !rule.target_ips.is_empty() {
+                let ip_match = rule.target_ips.iter().any(|rule_ip| {
+                    if rule_ip == "*" {
+                        return true;
+                    }
+                    if rule_ip.ends_with('*') {
+                        let prefix = &rule_ip[..rule_ip.len() - 1];
+                        return ip_str.starts_with(prefix);
+                    }
+                    rule_ip == ip_str
+                });
+                if !ip_match {
+                    continue;
                 }
-                if rule_ip.ends_with('*') {
-                    let prefix = &rule_ip[..rule_ip.len() - 1];
-                    return ip_str.starts_with(prefix);
+            }
+
+            // Both app, port, and IP constraints match
+            return rule.action == RuleAction::Proxy;
+        }
+
+        // 2. Check if the application is in the configured enabled apps list
+        if !app_name.is_empty() {
+            let is_configured_app = self.apps.iter().any(|app| {
+                if !app.enabled {
+                    return false;
                 }
-                rule_ip == ip_str
+                let name_lower = app.name.to_lowercase();
+                let path_file_lower = std::path::Path::new(&app.path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_lowercase())
+                    .unwrap_or_else(|| app.path.to_lowercase());
+
+                app_lower == path_file_lower
+                    || app_lower == name_lower
+                    || (app_lower.ends_with(".exe") && app_lower[..app_lower.len() - 4] == path_file_lower)
+                    || (path_file_lower.ends_with(".exe") && path_file_lower[..path_file_lower.len() - 4] == app_lower)
             });
 
-            if ip_matches {
-                return rule.action == RuleAction::Proxy;
+            if is_configured_app {
+                // By default, applications added to Proxify have their traffic proxied
+                return true;
             }
         }
 
+        // 3. Fallback to default action
         self.default_action == RuleAction::Proxy
+    }
+
+    /// Determines whether the given IP and port should be proxied based on configured rules.
+    pub fn should_proxy_ip(&self, ip_str: &str, port: u16) -> bool {
+        self.should_proxy("", ip_str, port)
     }
 
     /// Determines whether a hostname/domain matches the proxy rules.

@@ -5,6 +5,19 @@ All notable changes to `proxify-rs` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-05
+
+### Fixed
+- **Process Attachment & Transparent Proxy Routing**:
+  - Eliminated race condition by running hook initialization synchronously in `DllMain(DLL_PROCESS_ATTACH)` instead of a delayed background thread.
+  - Dynamically preloaded `ws2_32.dll` prior to hooking so MinHook never fails with `MH_ERROR_MODULE_NOT_FOUND` in newly spawned processes.
+  - Implemented application process name matching (`ProxyConfig::should_proxy`), ensuring configured apps automatically route traffic through the proxy without needing manual destination IP wildcard rules.
+  - Synchronized configuration globally to `%LOCALAPPDATA%\proxify\config.json`, allowing attached processes without inherited environment variables to load active routing rules.
+  - Stripped verbatim UNC `\\?\` prefix from DLL path to prevent `LoadLibraryW` failure across external applications.
+  - Added WOW64 32-bit architecture detection and `GetExitCodeThread` return checks to surface injection failures.
+  - Added live persistent file logging to `%LOCALAPPDATA%\proxify\hook.log`.
+  - Configured active default proxy port to `10808` (active v2rayN / Xray local SOCKS5 port).
+
 ## [0.3.0] - 2026-10-05
 
 ### Added

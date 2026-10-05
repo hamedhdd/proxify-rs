@@ -14,6 +14,7 @@ use windows_sys::Win32::Networking::WinSock::{
     WSAGetLastError, WSASetLastError, getsockopt, recv, select, send,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryA};
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 type ConnectFn = unsafe extern "system" fn(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
@@ -32,6 +33,32 @@ static ORIGINAL_WSACONNECT: OnceLock<WSAConnectFn> = OnceLock::new();
 static CONFIG: OnceLock<ProxyConfig> = OnceLock::new();
 static HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+fn chrono_format_now() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let secs = now % 60;
+    let mins = (now / 60) % 60;
+    let hours = (now / 3600) % 24;
+    format!("{:02}:{:02}:{:02}", hours, mins, secs)
+}
+
+fn get_current_process_name() -> String {
+    let mut buf = [0u16; 260];
+    unsafe {
+        let len = GetModuleFileNameW(core::ptr::null_mut(), buf.as_mut_ptr(), 260);
+        if len > 0 {
+            let path_str = String::from_utf16_lossy(&buf[..len as usize]);
+            if let Some(file_name) = std::path::Path::new(&path_str).file_name() {
+                return file_name.to_string_lossy().to_string();
+            }
+        }
+    }
+    "unknown.exe".to_string()
+}
+
 fn log_msg(msg: &str) {
     if std::env::var("PROXIFY_DEBUG").is_ok() {
         eprintln!("[proxify-hook] {}", msg);
@@ -40,9 +67,21 @@ fn log_msg(msg: &str) {
     unsafe {
         OutputDebugStringA(formatted.as_ptr());
     }
+
+    // Also append to persistent hook log in %LOCALAPPDATA%\proxify\hook.log so UI and user can verify!
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        let dir = PathBuf::from(&local_appdata).join("proxify");
+        let _ = fs::create_dir_all(&dir);
+        let log_path = dir.join("hook.log");
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] {}", chrono_format_now(), msg);
+        }
+    }
 }
 
 fn load_config() -> ProxyConfig {
+    // 1. Check PROXIFY_CONFIG environment variable
     if let Ok(path_str) = std::env::var("PROXIFY_CONFIG") {
         if let Ok(content) = fs::read_to_string(&path_str) {
             if let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content) {
@@ -52,13 +91,18 @@ fn load_config() -> ProxyConfig {
         }
     }
 
-    if let Ok(content) = fs::read_to_string("proxify.json") {
-        if let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content) {
-            log_msg("Loaded configuration from ./proxify.json");
-            return cfg;
+    // 2. Check %LOCALAPPDATA%\proxify\config.json
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        let p = PathBuf::from(local_appdata).join("proxify").join("config.json");
+        if let Ok(content) = fs::read_to_string(&p) {
+            if let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content) {
+                log_msg(&format!("Loaded configuration from {}", p.display()));
+                return cfg;
+            }
         }
     }
 
+    // 3. Check %APPDATA%\proxify\config.json
     if let Ok(appdata) = std::env::var("APPDATA") {
         let p = PathBuf::from(appdata).join("proxify").join("config.json");
         if let Ok(content) = fs::read_to_string(&p) {
@@ -69,7 +113,26 @@ fn load_config() -> ProxyConfig {
         }
     }
 
-    log_msg("Using default proxy configuration (127.0.0.1:1080)");
+    // 4. Check %USERPROFILE%\.proxify\config.json
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        let p = PathBuf::from(userprofile).join(".proxify").join("config.json");
+        if let Ok(content) = fs::read_to_string(&p) {
+            if let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content) {
+                log_msg(&format!("Loaded configuration from {}", p.display()));
+                return cfg;
+            }
+        }
+    }
+
+    // 5. Check ./proxify.json in current working directory
+    if let Ok(content) = fs::read_to_string("proxify.json") {
+        if let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content) {
+            log_msg("Loaded configuration from ./proxify.json");
+            return cfg;
+        }
+    }
+
+    log_msg("Fallback: Using default proxy configuration (127.0.0.1:1080)");
     ProxyConfig::default()
 }
 
@@ -254,16 +317,17 @@ unsafe fn handle_proxy_connect(
     let target_ip = Ipv4Addr::from(target_ip_bytes);
     let target_ip_str = target_ip.to_string();
 
+    let proc_name = get_current_process_name();
     let cfg = CONFIG.get_or_init(load_config);
 
-    if !cfg.should_proxy_ip(&target_ip_str, target_port) {
-        log_msg(&format!("DIRECT connection to {}:{}", target_ip_str, target_port));
+    if !cfg.should_proxy(&proc_name, &target_ip_str, target_port) {
+        log_msg(&format!("[DIRECT] {} -> {}:{}", proc_name, target_ip_str, target_port));
         return original_fn(s, name, namelen);
     }
 
     log_msg(&format!(
-        "PROXYING connection to {}:{} via SOCKS5 proxy {}:{}",
-        target_ip_str, target_port, cfg.proxy_host, cfg.proxy_port
+        "[PROXY] {} -> {}:{} via SOCKS5 {}:{}",
+        proc_name, target_ip_str, target_port, cfg.proxy_host, cfg.proxy_port
     ));
 
     // Prepare proxy address
@@ -296,11 +360,11 @@ unsafe fn handle_proxy_connect(
     // Now complete SOCKS5 tunnel handshake
     match perform_socks5_handshake(s, target_ip_bytes, target_port, cfg) {
         Ok(_) => {
-            log_msg(&format!("Successfully tunneled to {}:{}!", target_ip_str, target_port));
+            log_msg(&format!("✓ Successfully tunneled {} to {}:{}!", proc_name, target_ip_str, target_port));
             0
         }
         Err(err) => {
-            log_msg(&format!("SOCKS5 handshake failed: {}", err));
+            log_msg(&format!("✗ SOCKS5 handshake failed for {}: {}", target_ip_str, err));
             WSASetLastError(err);
             SOCKET_ERROR
         }
@@ -342,15 +406,19 @@ fn initialize_hooks() {
         return;
     }
 
-    log_msg("Initializing Winsock API hooks...");
+    let proc_name = get_current_process_name();
+    log_msg(&format!("Initializing Winsock API hooks in process '{}'...", proc_name));
     let _ = CONFIG.get_or_init(load_config);
 
     unsafe {
+        // Ensure ws2_32.dll is loaded into the process!
+        LoadLibraryA(b"ws2_32.dll\0".as_ptr());
+
         match MinHook::create_hook_api("ws2_32.dll", "connect", detour_connect as _) {
             Ok(orig) => {
                 let orig_fn: ConnectFn = core::mem::transmute(orig);
                 let _ = ORIGINAL_CONNECT.set(orig_fn);
-                log_msg("Hooked ws2_32.dll!connect");
+                log_msg("Hooked ws2_32.dll!connect successfully");
             }
             Err(e) => {
                 log_msg(&format!("Failed to hook connect: {:?}", e));
@@ -361,7 +429,7 @@ fn initialize_hooks() {
             Ok(orig) => {
                 let orig_fn: WSAConnectFn = core::mem::transmute(orig);
                 let _ = ORIGINAL_WSACONNECT.set(orig_fn);
-                log_msg("Hooked ws2_32.dll!WSAConnect");
+                log_msg("Hooked ws2_32.dll!WSAConnect successfully");
             }
             Err(e) => {
                 log_msg(&format!("Failed to hook WSAConnect: {:?}", e));
@@ -371,7 +439,7 @@ fn initialize_hooks() {
         if let Err(e) = MinHook::enable_all_hooks() {
             log_msg(&format!("Failed to enable hooks: {:?}", e));
         } else {
-            log_msg("All proxy hooks enabled successfully!");
+            log_msg(&format!("All proxy hooks ACTIVE and READY in '{}'!", proc_name));
         }
     }
 }
@@ -383,9 +451,7 @@ pub extern "system" fn DllMain(
     _lpv_reserved: *mut c_void,
 ) -> BOOL {
     if fdw_reason == DLL_PROCESS_ATTACH {
-        std::thread::spawn(|| {
-            initialize_hooks();
-        });
+        initialize_hooks();
     }
     1
 }

@@ -1,11 +1,28 @@
 {
   "proxy_host": "127.0.0.1",
-  "proxy_port": 1080,
+  "proxy_port": 10808,
+  "proxy_username": null,
+  "proxy_password": null,
+  "theme": "dark",
   "default_action": "direct",
   "rules": [
     {
+      "name": "Localhost & Loopback Bypass",
+      "action": "direct",
+      "target_apps": [],
+      "target_ips": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "target_ports": [],
+      "target_hosts": [
+        "localhost"
+      ]
+    },
+    {
       "name": "Proxy Specific Corporate Subnet",
       "action": "proxy",
+      "target_apps": [],
       "target_ips": [
         "198.51.100.*",
         "203.0.113.10"
@@ -18,18 +35,14 @@
       "target_hosts": [
         "*.corp.example.com"
       ]
-    },
+    }
+  ],
+  "apps": [
     {
-      "name": "Direct Localhost Bypass",
-      "action": "direct",
-      "target_ips": [
-        "127.0.0.1",
-        "::1"
-      ],
-      "target_ports": [],
-      "target_hosts": [
-        "localhost"
-      ]
+      "name": "Curl CLI Tool",
+      "path": "curl.exe",
+      "args": "https://api.myip.com",
+      "enabled": true
     }
   ]
 }
