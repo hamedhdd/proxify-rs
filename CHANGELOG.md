@@ -5,6 +5,27 @@ All notable changes to `proxify-rs` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-05
+
+### Added
+- **Automatic & Safe Unhooking on App Exit**:
+  - Automatically unhooks all attached target processes when `proxify-ui` is closed (via `eframe::App::on_exit` and `Drop` handlers).
+  - Cleanly disables hooks via `MinHook::disable_all_hooks()`, restores original Winsock2 bytecode, and unmaps the DLL memory space.
+- **Automatic Detaching on App Deletion**:
+  - Deleting or removing an application from the Applications list automatically locates any running instances and unhooks them immediately with clear activity logs.
+- **On-Demand Detaching in GUI**:
+  - **Applications Tab**: Added `🔌 Detach All` button to app cards with running instances and dynamic `● Hooked (N)` status indicators.
+  - **Running Processes Tab**: Added `● Hooked` badges and individual `🔌 Detach Proxy` / group `🔌 Detach All (N PIDs)` action buttons.
+  - Added `🔌 Detach All Filtered` button for fast search-based bulk detaching.
+- **CLI `detach` Subcommand**:
+  - `proxify detach --name <APP>`: Ejects the hook and restores original Winsock APIs across all running instances of the specified process name.
+  - `proxify detach --pid <PID>`: Ejects the hook from a specific target process ID.
+- **Multi-Instance DLL Ejection Engine (`eject_dll`)**:
+  - Uses `EnumProcessModules` and `GetModuleBaseNameA` to locate the target `HMODULE` address in the remote process.
+  - Invokes `FreeLibrary` via `CreateRemoteThread` in an adaptive loop, correctly handling Windows DLL loader reference counts until the module is 100% unmapped with zero crashes or residual code.
+- **Hook Uninitialization (`DLL_PROCESS_DETACH`)**:
+  - Added `uninitialize_hooks()` in `proxify-hook`, restoring original `connect` and `WSAConnect` entrypoints cleanly before unmapping.
+
 ## [0.4.0] - 2026-10-05
 
 ### Added

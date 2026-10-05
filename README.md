@@ -162,7 +162,23 @@ In the GUI (`proxify-ui`):
 - **Applications Tab**: Each app card features an **"⚡ Attach All (N running)"** button to hook all active instances with one click.
 - **Running Processes Tab**: Multi-process applications are automatically grouped with an **"⚡ Attach All (N PIDs)"** button and a top-level **"⚡ Attach All Filtered"** action.
 
-### 4. Inspect Configuration
+### 4. Detach & Unhook Running Processes (Clean Exit & Ejection)
+Safely eject the proxy hook and restore original Winsock2 API bytecode without restarting the application:
+```cmd
+# Detach and restore Winsock APIs across ALL running instances of an application:
+proxify.exe detach --name telegram.exe
+proxify.exe detach -n firefox.exe
+
+# Or detach a specific PID:
+proxify.exe detach --pid 16392
+```
+
+In the GUI (`proxify-ui`):
+- **Automatic on App Exit**: Closing `proxify-ui` automatically invokes `FreeLibrary` on all attached PIDs, cleanly disabling hooks via MinHook and restoring original socket handlers.
+- **Automatic on App Deletion**: Deleting or removing an application from the list automatically detects and cleanly unhooks all running instances of that app.
+- **On-Demand Buttons**: App cards and process groups feature **"🔌 Detach All"** and **"🔌 Detach Proxy"** buttons alongside live status indicators (`● Hooked`).
+
+### 5. Inspect Configuration
 ```cmd
 proxify.exe config show --config proxify.json
 ```

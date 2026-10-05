@@ -3,7 +3,8 @@
 
 use eframe::egui;
 use proxify_core::{AppConfig, ProxyConfig, Rule, RuleAction, socks5};
-use std::ffi::OsStr;
+use std::collections::HashSet;
+use std::ffi::{c_void, OsStr};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED};
+use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, HMODULE, INVALID_HANDLE_VALUE, WAIT_FAILED};
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
@@ -21,6 +22,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
+use windows_sys::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameA};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateProcessW, CreateRemoteThread, OpenProcess, PROCESS_CREATE_THREAD,
     PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
@@ -31,6 +33,13 @@ use windows_sys::Win32::System::Threading::{
 pub struct ProcessItem {
     pub pid: u32,
     pub name: String,
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Log(String),
+    Attached(u32),
+    Detached(u32),
 }
 
 #[derive(PartialEq)]
@@ -77,8 +86,11 @@ struct ProxifyApp {
     processes: Vec<ProcessItem>,
 
     // Async background task communication
-    log_tx: Sender<String>,
-    log_rx: Receiver<String>,
+    event_tx: Sender<AppEvent>,
+    event_rx: Receiver<AppEvent>,
+
+    // Track attached PIDs for automatic unhooking on app removal or exit
+    attached_pids: HashSet<u32>,
 
     // Activity log entries
     logs: Vec<String>,
@@ -103,7 +115,7 @@ impl ProxifyApp {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
         }
 
-        let (log_tx, log_rx) = channel();
+        let (event_tx, event_rx) = channel();
 
         let mut app = Self {
             config,
@@ -125,8 +137,9 @@ impl ProxifyApp {
             confirm_delete_rule: None,
             is_dark_theme,
             processes: Vec::new(),
-            log_tx,
-            log_rx,
+            event_tx,
+            event_rx,
+            attached_pids: HashSet::new(),
             logs: vec!["Proxify UI initialized. Ready to control apps and routes.".to_string()],
         };
 
@@ -178,7 +191,7 @@ impl ProxifyApp {
         let target = format!("{}:{}", self.config.proxy_host, self.config.proxy_port);
         let username = self.config.proxy_username.clone();
         let password = self.config.proxy_password.clone();
-        let tx = self.log_tx.clone();
+        let tx = self.event_tx.clone();
 
         self.log(&format!("Testing connection to SOCKS5 proxy at {}...", target));
 
@@ -195,13 +208,13 @@ impl ProxifyApp {
                                 let has_auth = username.is_some() && password.is_some();
                                 let greeting = socks5::build_greeting_methods(has_auth);
                                 if stream.write_all(&greeting).is_err() {
-                                    let _ = tx.send("Error: Failed to send SOCKS5 greeting.".to_string());
+                                    let _ = tx.send(AppEvent::Log("Error: Failed to send SOCKS5 greeting.".to_string()));
                                     return;
                                 }
 
                                 let mut resp = [0u8; 2];
                                 if stream.read_exact(&mut resp).is_err() || resp[0] != socks5::SOCKS_VERSION {
-                                    let _ = tx.send("Error: Proxy rejected greeting or returned invalid version.".to_string());
+                                    let _ = tx.send(AppEvent::Log("Error: Proxy rejected greeting or returned invalid version.".to_string()));
                                     return;
                                 }
 
@@ -211,27 +224,27 @@ impl ProxifyApp {
                                         let _ = stream.write_all(&auth_req);
                                         let mut auth_resp = [0u8; 2];
                                         if stream.read_exact(&mut auth_resp).is_ok() && socks5::verify_auth_response(&auth_resp) {
-                                            let _ = tx.send(format!("✓ Proxy at {} is ONLINE and AUTHENTICATED (User/Pass OK)!", target));
+                                            let _ = tx.send(AppEvent::Log(format!("✓ Proxy at {} is ONLINE and AUTHENTICATED (User/Pass OK)!", target)));
                                         } else {
-                                            let _ = tx.send("✗ Proxy reached, but authentication was rejected by the server!".to_string());
+                                            let _ = tx.send(AppEvent::Log("✗ Proxy reached, but authentication was rejected by the server!".to_string()));
                                         }
                                     } else {
-                                        let _ = tx.send("✗ Proxy requires authentication, but no credentials configured.".to_string());
+                                        let _ = tx.send(AppEvent::Log("✗ Proxy requires authentication, but no credentials configured.".to_string()));
                                     }
                                 } else if resp[1] == socks5::AUTH_NONE {
-                                    let _ = tx.send(format!("✓ Proxy at {} is ONLINE (No Authentication required)!", target));
+                                    let _ = tx.send(AppEvent::Log(format!("✓ Proxy at {} is ONLINE (No Authentication required)!", target)));
                                 } else {
-                                    let _ = tx.send(format!("✗ Proxy selected unsupported authentication method code: 0x{:02X}", resp[1]));
+                                    let _ = tx.send(AppEvent::Log(format!("✗ Proxy selected unsupported authentication method code: 0x{:02X}", resp[1])));
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(format!("✗ Could not connect to SOCKS5 proxy at {}: {}", target, e));
+                                let _ = tx.send(AppEvent::Log(format!("✗ Could not connect to SOCKS5 proxy at {}: {}", target, e)));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(format!("✗ Failed to resolve proxy address: {}", e));
+                    let _ = tx.send(AppEvent::Log(format!("✗ Failed to resolve proxy address: {}", e)));
                 }
             }
         });
@@ -250,7 +263,7 @@ impl ProxifyApp {
 
         let canon_cfg = self.config_path.canonicalize().unwrap_or(self.config_path.clone());
         let cfg_str = canon_cfg.to_str().unwrap_or("").to_string();
-        let tx = self.log_tx.clone();
+        let tx = self.event_tx.clone();
 
         self.log(&format!("Launching application asynchronously: {} {}", app_path, app_args));
 
@@ -289,19 +302,20 @@ impl ProxifyApp {
 
                 if ok == 0 {
                     let err = std::io::Error::last_os_error();
-                    let _ = tx.send(format!("✗ CreateProcessW failed for '{}': {}", app_path, err));
+                    let _ = tx.send(AppEvent::Log(format!("✗ CreateProcessW failed for '{}': {}", app_path, err)));
                     return;
                 }
 
                 let pid = proc_info.dwProcessId;
-                let _ = tx.send(format!("==> Target process created suspended (PID: {}). Injecting hook...", pid));
+                let _ = tx.send(AppEvent::Log(format!("==> Target process created suspended (PID: {}). Injecting hook...", pid)));
 
                 match inject_dll(proc_info.hProcess, &dll_path) {
                     Ok(_) => {
-                        let _ = tx.send(format!("✓ Hook successfully injected into PID {}! Resuming execution...", pid));
+                        let _ = tx.send(AppEvent::Log(format!("✓ Hook successfully injected into PID {}! Resuming execution...", pid)));
+                        let _ = tx.send(AppEvent::Attached(pid));
                     }
                     Err(e) => {
-                        let _ = tx.send(format!("✗ DLL injection failed for PID {}: {}", pid, e));
+                        let _ = tx.send(AppEvent::Log(format!("✗ DLL injection failed for PID {}: {}", pid, e)));
                     }
                 }
 
@@ -312,15 +326,15 @@ impl ProxifyApp {
         });
     }
 
-fn find_matching_pids(processes: &[ProcessItem], app_name: &str, app_path: &str) -> Vec<(u32, String)> {
-    let mut matches = Vec::new();
-    let name_lower = app_name.to_lowercase();
-    let path_file_lower = std::path::Path::new(app_path)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| app_path.to_lowercase());
+    pub fn find_matching_pids(processes: &[ProcessItem], app_name: &str, app_path: &str) -> Vec<(u32, String)> {
+        let mut matches = Vec::new();
+        let name_lower = app_name.to_lowercase();
+        let path_file_lower = std::path::Path::new(app_path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_lowercase())
+            .unwrap_or_else(|| app_path.to_lowercase());
 
-    for proc in processes {
+        for proc in processes {
             let p_lower = proc.name.to_lowercase();
             let matches_app = p_lower == name_lower
                 || p_lower == path_file_lower
@@ -353,7 +367,7 @@ fn find_matching_pids(processes: &[ProcessItem], app_name: &str, app_path: &str)
         self.save_config();
         let canon_cfg = self.config_path.canonicalize().unwrap_or(self.config_path.clone());
         let cfg_str = canon_cfg.to_str().unwrap_or("").to_string();
-        let tx = self.log_tx.clone();
+        let tx = self.event_tx.clone();
 
         let total = targets.len();
         self.log(&format!("Starting batch attach to {} process instance(s)...", total));
@@ -373,30 +387,110 @@ fn find_matching_pids(processes: &[ProcessItem], app_name: &str, app_path: &str)
                     let h_proc = OpenProcess(desired_access, FALSE, *pid);
                     if h_proc.is_null() {
                         let err = std::io::Error::last_os_error();
-                        let _ = tx.send(format!("✗ Failed to open PID {} ({}): {}", pid, proc_name, err));
+                        let _ = tx.send(AppEvent::Log(format!("✗ Failed to open PID {} ({}): {}", pid, proc_name, err)));
                         continue;
                     }
 
                     match inject_dll(h_proc, &dll_path) {
                         Ok(_) => {
-                            let _ = tx.send(format!("✓ Successfully attached proxy hook to {} (PID {})!", proc_name, pid));
+                            let _ = tx.send(AppEvent::Log(format!("✓ Successfully attached proxy hook to {} (PID {})!", proc_name, pid)));
+                            let _ = tx.send(AppEvent::Attached(*pid));
                             success_count += 1;
                         }
                         Err(e) => {
-                            let _ = tx.send(format!("✗ Failed injecting into {} (PID {}): {}", proc_name, pid, e));
+                            let _ = tx.send(AppEvent::Log(format!("✗ Failed injecting into {} (PID {}): {}", proc_name, pid, e)));
                         }
                     }
                     CloseHandle(h_proc);
                 }
             }
 
-            let _ = tx.send(format!("==> Batch attach completed: {}/{} processes successfully hooked!", success_count, total));
+            let _ = tx.send(AppEvent::Log(format!("==> Batch attach completed: {}/{} processes successfully hooked!", success_count, total)));
         });
+    }
+
+    fn detach_from_pids_async(&mut self, targets: Vec<(u32, String)>) {
+        if targets.is_empty() {
+            self.log("No matching running processes found to detach.");
+            return;
+        }
+
+        let tx = self.event_tx.clone();
+        let total = targets.len();
+        self.log(&format!("Starting batch detach from {} process instance(s)...", total));
+
+        std::thread::spawn(move || {
+            let desired_access = PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ;
+
+            let mut success_count = 0;
+            for (pid, proc_name) in &targets {
+                unsafe {
+                    let h_proc = OpenProcess(desired_access, FALSE, *pid);
+                    if h_proc.is_null() {
+                        let err = std::io::Error::last_os_error();
+                        let _ = tx.send(AppEvent::Log(format!("✗ Failed to open PID {} ({}): {}", pid, proc_name, err)));
+                        continue;
+                    }
+
+                    match eject_dll(h_proc, "proxify_hook.dll") {
+                        Ok(_) => {
+                            let _ = tx.send(AppEvent::Log(format!("✓ Successfully detached and unhooked proxy from {} (PID {})!", proc_name, pid)));
+                            let _ = tx.send(AppEvent::Detached(*pid));
+                            success_count += 1;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Log(format!("✗ Failed unhooking {} (PID {}): {}", proc_name, pid, e)));
+                        }
+                    }
+                    CloseHandle(h_proc);
+                }
+            }
+
+            let _ = tx.send(AppEvent::Log(format!("==> Batch detach completed: {}/{} processes cleanly unhooked!", success_count, total)));
+        });
+    }
+
+    fn detach_all_attached_pids_sync(&mut self) {
+        if self.attached_pids.is_empty() {
+            return;
+        }
+
+        let desired_access = PROCESS_CREATE_THREAD
+            | PROCESS_QUERY_INFORMATION
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_WRITE
+            | PROCESS_VM_READ;
+
+        for &pid in &self.attached_pids {
+            unsafe {
+                let h_proc = OpenProcess(desired_access, FALSE, pid);
+                if !h_proc.is_null() {
+                    let _ = eject_dll(h_proc, "proxify_hook.dll");
+                    CloseHandle(h_proc);
+                }
+            }
+        }
+        self.attached_pids.clear();
     }
 
     #[allow(dead_code)]
     fn attach_to_pid_async(&mut self, pid: u32, proc_name: String) {
         self.attach_to_pids_async(vec![(pid, proc_name)]);
+    }
+
+    #[allow(dead_code)]
+    fn detach_from_pid_async(&mut self, pid: u32, proc_name: String) {
+        self.detach_from_pids_async(vec![(pid, proc_name)]);
+    }
+}
+
+impl Drop for ProxifyApp {
+    fn drop(&mut self) {
+        self.detach_all_attached_pids_sync();
     }
 }
 
@@ -538,6 +632,110 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
     Ok(())
 }
 
+unsafe fn eject_dll(process_handle: HANDLE, module_name: &str) -> Result<(), String> {
+    let kernel32_name = b"kernel32.dll\0";
+    let h_kernel32 = GetModuleHandleA(kernel32_name.as_ptr());
+    if h_kernel32.is_null() {
+        return Err("GetModuleHandleA kernel32.dll failed".to_string());
+    }
+
+    let free_library_name = b"FreeLibrary\0";
+    let free_library_addr = GetProcAddress(h_kernel32, free_library_name.as_ptr());
+    if free_library_addr.is_none() {
+        return Err("GetProcAddress FreeLibrary failed".to_string());
+    }
+    let thread_start_routine = core::mem::transmute(free_library_addr);
+
+    let target_name_lower = module_name.to_lowercase();
+    let mut attempts = 0;
+
+    // Call FreeLibrary repeatedly until the module is completely unmapped
+    loop {
+        let mut modules: [HMODULE; 1024] = [core::ptr::null_mut(); 1024];
+        let mut cb_needed: u32 = 0;
+        let ok = EnumProcessModules(
+            process_handle,
+            modules.as_mut_ptr(),
+            (modules.len() * core::mem::size_of::<HMODULE>()) as u32,
+            &mut cb_needed,
+        );
+
+        if ok == 0 {
+            if attempts > 0 {
+                return Ok(());
+            }
+            return Err(format!("EnumProcessModules failed: {}", std::io::Error::last_os_error()));
+        }
+
+        let count = (cb_needed as usize) / core::mem::size_of::<HMODULE>();
+        let mut target_hmodule: Option<HMODULE> = None;
+
+        for &h_mod in &modules[..count.min(modules.len())] {
+            if h_mod.is_null() {
+                continue;
+            }
+            let mut name_buf = [0u8; 260];
+            let len = GetModuleBaseNameA(
+                process_handle,
+                h_mod,
+                name_buf.as_mut_ptr(),
+                name_buf.len() as u32,
+            );
+            if len > 0 {
+                let name_str = String::from_utf8_lossy(&name_buf[..len as usize]).to_lowercase();
+                if name_str == target_name_lower {
+                    target_hmodule = Some(h_mod);
+                    break;
+                }
+            }
+        }
+
+        let h_mod = match target_hmodule {
+            Some(m) => m,
+            None => {
+                if attempts > 0 {
+                    return Ok(());
+                } else {
+                    return Err(format!("Module '{}' is not loaded in target process.", module_name));
+                }
+            }
+        };
+
+        attempts += 1;
+        if attempts > 25 {
+            return Err(format!("Module '{}' could not be unloaded after 25 FreeLibrary attempts.", module_name));
+        }
+
+        let h_thread = CreateRemoteThread(
+            process_handle,
+            core::ptr::null(),
+            0,
+            thread_start_routine,
+            h_mod as *const c_void,
+            0,
+            core::ptr::null_mut(),
+        );
+
+        if h_thread.is_null() {
+            return Err(format!("CreateRemoteThread FreeLibrary failed: {}", std::io::Error::last_os_error()));
+        }
+
+        let wait_res = WaitForSingleObject(h_thread, 10000);
+        if wait_res == WAIT_FAILED {
+            CloseHandle(h_thread);
+            return Err("WaitForSingleObject failed on FreeLibrary thread".to_string());
+        }
+
+        let mut exit_code: u32 = 0;
+        windows_sys::Win32::System::Threading::GetExitCodeThread(h_thread, &mut exit_code);
+        CloseHandle(h_thread);
+
+        if exit_code == 0 {
+            return Err("FreeLibrary returned FALSE in target process.".to_string());
+        }
+    }
+}
+
 fn list_running_processes() -> Vec<ProcessItem> {
     let mut procs = Vec::new();
     unsafe {
@@ -579,15 +777,25 @@ fn list_running_processes() -> Vec<ProcessItem> {
 
 impl eframe::App for ProxifyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain asynchronous background task logs
-        while let Ok(msg) = self.log_rx.try_recv() {
-            self.log(&msg);
-            if msg.starts_with('✓') {
-                self.test_status = Some("Online".to_string());
-                self.test_success = true;
-            } else if msg.starts_with('✗') {
-                self.test_status = Some("Failed".to_string());
-                self.test_success = false;
+        // Drain asynchronous background task events
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                AppEvent::Log(msg) => {
+                    self.log(&msg);
+                    if msg.starts_with('✓') {
+                        self.test_status = Some("Online".to_string());
+                        self.test_success = true;
+                    } else if msg.starts_with('✗') {
+                        self.test_status = Some("Failed".to_string());
+                        self.test_success = false;
+                    }
+                }
+                AppEvent::Attached(pid) => {
+                    self.attached_pids.insert(pid);
+                }
+                AppEvent::Detached(pid) => {
+                    self.attached_pids.remove(&pid);
+                }
             }
         }
 
@@ -678,6 +886,10 @@ impl eframe::App for ProxifyApp {
             }
         });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.detach_all_attached_pids_sync();
+    }
 }
 
 impl ProxifyApp {
@@ -745,12 +957,14 @@ impl ProxifyApp {
         // Configured Apps Table
         let mut to_launch: Option<(String, String)> = None;
         let mut to_attach_batch: Option<Vec<(u32, String)>> = None;
+        let mut to_detach_batch: Option<Vec<(u32, String)>> = None;
         let mut to_remove: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (idx, app) in self.config.apps.iter_mut().enumerate() {
                 let running_targets = Self::find_matching_pids(&self.processes, &app.name, &app.path);
                 let run_count = running_targets.len();
+                let attached_count = running_targets.iter().filter(|(p, _)| self.attached_pids.contains(p)).count();
 
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
@@ -761,10 +975,14 @@ impl ProxifyApp {
                             ui.label(format!("Args: {}", app.args));
                         }
 
+                        if attached_count > 0 {
+                            ui.colored_label(egui::Color32::from_rgb(46, 204, 113), format!("● Hooked ({})", attached_count));
+                        }
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Confirm-on-delete check
                             if self.confirm_delete_app == Some(idx) {
-                                if ui.button(egui::RichText::new("Yes, Delete").color(egui::Color32::RED)).clicked() {
+                                if ui.button(egui::RichText::new("Yes, Delete & Unhook").color(egui::Color32::RED)).clicked() {
                                     to_remove = Some(idx);
                                     self.confirm_delete_app = None;
                                 }
@@ -782,6 +1000,12 @@ impl ProxifyApp {
                             }
 
                             if run_count > 0 {
+                                if attached_count > 0 {
+                                    if ui.button(egui::RichText::new("🔌 Detach All").color(egui::Color32::from_rgb(231, 76, 60))).clicked() {
+                                        to_detach_batch = Some(running_targets.clone());
+                                    }
+                                }
+
                                 let btn_text = format!("⚡ Attach All ({} running)", run_count);
                                 if ui.button(egui::RichText::new(btn_text).color(egui::Color32::from_rgb(52, 152, 219))).clicked() {
                                     to_attach_batch = Some(running_targets);
@@ -798,6 +1022,14 @@ impl ProxifyApp {
         });
 
         if let Some(idx) = to_remove {
+            if let Some(app) = self.config.apps.get(idx) {
+                // Find and cleanly unhook any running instances before deleting the app
+                let running_targets = Self::find_matching_pids(&self.processes, &app.name, &app.path);
+                if !running_targets.is_empty() {
+                    self.log(&format!("App '{}' removed. Detaching and unhooking all {} running process(es)...", app.name, running_targets.len()));
+                    self.detach_from_pids_async(running_targets);
+                }
+            }
             self.config.apps.remove(idx);
             self.save_config();
         }
@@ -808,6 +1040,10 @@ impl ProxifyApp {
 
         if let Some(targets) = to_attach_batch {
             self.attach_to_pids_async(targets);
+        }
+
+        if let Some(targets) = to_detach_batch {
+            self.detach_from_pids_async(targets);
         }
     }
 
@@ -996,6 +1232,7 @@ impl ProxifyApp {
 
         let total_matched_pids: usize = grouped.values().map(|v| v.len()).sum();
         let mut attach_batch: Option<Vec<(u32, String)>> = None;
+        let mut detach_batch: Option<Vec<(u32, String)>> = None;
 
         if !search.is_empty() && total_matched_pids > 0 {
             ui.horizontal(|ui| {
@@ -1009,18 +1246,33 @@ impl ProxifyApp {
                     }
                     attach_batch = Some(targets);
                 }
+                if ui.button(egui::RichText::new(format!("🔌 Detach All Filtered ({} PIDs)", total_matched_pids)).color(egui::Color32::from_rgb(231, 76, 60))).clicked() {
+                    let mut targets = Vec::new();
+                    for (name, pids) in &grouped {
+                        for p in pids {
+                            targets.push((*p, name.clone()));
+                        }
+                    }
+                    detach_batch = Some(targets);
+                }
             });
             ui.add_space(4.0);
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (name, pids) in &grouped {
+                let attached_count = pids.iter().filter(|p| self.attached_pids.contains(p)).count();
+
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(name).strong());
                         let count = pids.len();
                         if count > 1 {
                             ui.colored_label(egui::Color32::from_rgb(241, 196, 15), format!("({} instances)", count));
+                        }
+
+                        if attached_count > 0 {
+                            ui.colored_label(egui::Color32::from_rgb(46, 204, 113), format!("● Hooked ({})", attached_count));
                         }
 
                         let pids_preview = if count <= 4 {
@@ -1032,14 +1284,28 @@ impl ProxifyApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if count > 1 {
+                                if attached_count > 0 {
+                                    let btn_detach = format!("🔌 Detach All ({} PIDs)", count);
+                                    if ui.button(egui::RichText::new(btn_detach).color(egui::Color32::from_rgb(231, 76, 60))).clicked() {
+                                        let targets = pids.iter().map(|p| (*p, name.clone())).collect();
+                                        detach_batch = Some(targets);
+                                    }
+                                }
+
                                 let btn_text = format!("⚡ Attach All ({} PIDs)", count);
                                 if ui.button(egui::RichText::new(btn_text).color(egui::Color32::from_rgb(52, 152, 219))).clicked() {
                                     let targets = pids.iter().map(|p| (*p, name.clone())).collect();
                                     attach_batch = Some(targets);
                                 }
                             } else if let Some(&single_pid) = pids.first() {
-                                if ui.button("⚡ Attach Proxy").clicked() {
-                                    attach_batch = Some(vec![(single_pid, name.clone())]);
+                                if self.attached_pids.contains(&single_pid) {
+                                    if ui.button(egui::RichText::new("🔌 Detach Proxy").color(egui::Color32::from_rgb(231, 76, 60))).clicked() {
+                                        detach_batch = Some(vec![(single_pid, name.clone())]);
+                                    }
+                                } else {
+                                    if ui.button("⚡ Attach Proxy").clicked() {
+                                        attach_batch = Some(vec![(single_pid, name.clone())]);
+                                    }
                                 }
                             }
                         });
@@ -1050,6 +1316,10 @@ impl ProxifyApp {
 
         if let Some(targets) = attach_batch {
             self.attach_to_pids_async(targets);
+        }
+
+        if let Some(targets) = detach_batch {
+            self.detach_from_pids_async(targets);
         }
     }
 

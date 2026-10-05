@@ -15,7 +15,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryA};
-use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows_sys::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 
 type ConnectFn = unsafe extern "system" fn(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
 type WSAConnectFn = unsafe extern "system" fn(
@@ -444,14 +444,33 @@ fn initialize_hooks() {
     }
 }
 
+fn uninitialize_hooks() {
+    if !HOOK_INITIALIZED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let proc_name = get_current_process_name();
+    log_msg(&format!("Unhooking and detaching from process '{}'...", proc_name));
+    unsafe {
+        let _ = MinHook::disable_all_hooks();
+        let _ = MinHook::uninitialize();
+    }
+    log_msg(&format!("✓ All Winsock hooks cleanly disabled and restored in '{}'.", proc_name));
+}
+
 #[no_mangle]
 pub extern "system" fn DllMain(
     _hinst_dll: HANDLE,
     fdw_reason: u32,
     _lpv_reserved: *mut c_void,
 ) -> BOOL {
-    if fdw_reason == DLL_PROCESS_ATTACH {
-        initialize_hooks();
+    match fdw_reason {
+        DLL_PROCESS_ATTACH => {
+            initialize_hooks();
+        }
+        DLL_PROCESS_DETACH => {
+            uninitialize_hooks();
+        }
+        _ => {}
     }
     1
 }

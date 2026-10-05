@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use proxify_core::{ProxyConfig, Rule, RuleAction, socks5};
-use std::ffi::OsStr;
+use std::ffi::{c_void, OsStr};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -8,7 +8,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED};
+use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, HMODULE, INVALID_HANDLE_VALUE, WAIT_FAILED};
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
@@ -17,6 +17,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
+use windows_sys::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameA};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateProcessW, CreateRemoteThread, OpenProcess, PROCESS_CREATE_THREAD,
     PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
@@ -68,6 +69,17 @@ enum Commands {
         /// Path to custom proxify_hook.dll
         #[arg(long)]
         dll: Option<PathBuf>,
+    },
+
+    /// Detach and unhook proxy from running processes by PID or Name (restores original Winsock handlers)
+    Detach {
+        /// Process ID (PID)
+        #[arg(short, long)]
+        pid: Option<u32>,
+
+        /// Process executable name (e.g. "telegram.exe", "firefox", "chrome") — detaches from ALL matching PIDs!
+        #[arg(short, long)]
+        name: Option<String>,
     },
 
     /// Manage configuration rules
@@ -236,6 +248,110 @@ unsafe fn inject_dll(process_handle: HANDLE, dll_path: &Path) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+unsafe fn eject_dll(process_handle: HANDLE, module_name: &str) -> Result<(), String> {
+    let kernel32_name = b"kernel32.dll\0";
+    let h_kernel32 = GetModuleHandleA(kernel32_name.as_ptr());
+    if h_kernel32.is_null() {
+        return Err("GetModuleHandleA kernel32.dll failed".to_string());
+    }
+
+    let free_library_name = b"FreeLibrary\0";
+    let free_library_addr = GetProcAddress(h_kernel32, free_library_name.as_ptr());
+    if free_library_addr.is_none() {
+        return Err("GetProcAddress FreeLibrary failed".to_string());
+    }
+    let thread_start_routine = core::mem::transmute(free_library_addr);
+
+    let target_name_lower = module_name.to_lowercase();
+    let mut attempts = 0;
+
+    // Call FreeLibrary repeatedly until the module is completely unmapped
+    loop {
+        let mut modules: [HMODULE; 1024] = [core::ptr::null_mut(); 1024];
+        let mut cb_needed: u32 = 0;
+        let ok = EnumProcessModules(
+            process_handle,
+            modules.as_mut_ptr(),
+            (modules.len() * core::mem::size_of::<HMODULE>()) as u32,
+            &mut cb_needed,
+        );
+
+        if ok == 0 {
+            if attempts > 0 {
+                return Ok(());
+            }
+            return Err(format!("EnumProcessModules failed: {}", std::io::Error::last_os_error()));
+        }
+
+        let count = (cb_needed as usize) / core::mem::size_of::<HMODULE>();
+        let mut target_hmodule: Option<HMODULE> = None;
+
+        for &h_mod in &modules[..count.min(modules.len())] {
+            if h_mod.is_null() {
+                continue;
+            }
+            let mut name_buf = [0u8; 260];
+            let len = GetModuleBaseNameA(
+                process_handle,
+                h_mod,
+                name_buf.as_mut_ptr(),
+                name_buf.len() as u32,
+            );
+            if len > 0 {
+                let name_str = String::from_utf8_lossy(&name_buf[..len as usize]).to_lowercase();
+                if name_str == target_name_lower {
+                    target_hmodule = Some(h_mod);
+                    break;
+                }
+            }
+        }
+
+        let h_mod = match target_hmodule {
+            Some(m) => m,
+            None => {
+                if attempts > 0 {
+                    return Ok(());
+                } else {
+                    return Err(format!("Module '{}' is not loaded in target process.", module_name));
+                }
+            }
+        };
+
+        attempts += 1;
+        if attempts > 25 {
+            return Err(format!("Module '{}' could not be unloaded after 25 FreeLibrary attempts.", module_name));
+        }
+
+        let h_thread = CreateRemoteThread(
+            process_handle,
+            core::ptr::null(),
+            0,
+            thread_start_routine,
+            h_mod as *const c_void,
+            0,
+            core::ptr::null_mut(),
+        );
+
+        if h_thread.is_null() {
+            return Err(format!("CreateRemoteThread FreeLibrary failed: {}", std::io::Error::last_os_error()));
+        }
+
+        let wait_res = WaitForSingleObject(h_thread, 10000);
+        if wait_res == WAIT_FAILED {
+            CloseHandle(h_thread);
+            return Err("WaitForSingleObject failed on FreeLibrary thread".to_string());
+        }
+
+        let mut exit_code: u32 = 0;
+        windows_sys::Win32::System::Threading::GetExitCodeThread(h_thread, &mut exit_code);
+        CloseHandle(h_thread);
+
+        if exit_code == 0 {
+            return Err("FreeLibrary returned FALSE in target process.".to_string());
+        }
+    }
 }
 
 fn resolve_config(cfg_path: Option<&Path>) -> (ProxyConfig, Option<PathBuf>) {
@@ -412,6 +528,56 @@ fn main() {
                 }
             }
             println!("==> Finished: Successfully attached to {}/{} process(es).", success_count, targets.len());
+        }
+
+        Commands::Detach { pid, name } => {
+            let targets: Vec<(u32, String)> = match (pid, name) {
+                (Some(p), None) => vec![(p, format!("PID {}", p))],
+                (None, Some(ref n)) => {
+                    let found = find_pids_by_name(n);
+                    if found.is_empty() {
+                        eprintln!("No running processes found matching '{}'", n);
+                        std::process::exit(1);
+                    }
+                    found
+                }
+                (Some(p), Some(n)) => {
+                    println!("Detaching from explicit PID {} ({})", p, n);
+                    vec![(p, n)]
+                }
+                (None, None) => {
+                    eprintln!("Error: Please specify either --pid <PID> or --name <PROCESS_NAME> (e.g. proxify detach --name telegram.exe)");
+                    std::process::exit(1);
+                }
+            };
+
+            println!("==> Found {} target process(es) to detach & unhook:", targets.len());
+            let desired_access = PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ;
+
+            let mut success_count = 0;
+            for (p, proc_name) in &targets {
+                let h_proc = unsafe { OpenProcess(desired_access, FALSE, *p) };
+                if h_proc.is_null() {
+                    eprintln!("  ✗ PID {} ({}): Failed to open (Access Denied / not running): {}", p, proc_name, std::io::Error::last_os_error());
+                    continue;
+                }
+
+                unsafe {
+                    match eject_dll(h_proc, "proxify_hook.dll") {
+                        Ok(_) => {
+                            println!("  ✓ PID {} ({}): Detached proxify hook and restored original Winsock APIs cleanly", p, proc_name);
+                            success_count += 1;
+                        }
+                        Err(e) => eprintln!("  ✗ PID {} ({}): Detach failed: {}", p, proc_name, e),
+                    }
+                    CloseHandle(h_proc);
+                }
+            }
+            println!("==> Finished: Successfully detached from {}/{} process(es).", success_count, targets.len());
         }
 
         Commands::Config { action } => match action {
