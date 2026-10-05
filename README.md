@@ -146,11 +146,21 @@ proxify.exe run curl.exe https://api.myip.com
 proxify.exe run "C:\Path\To\App.exe" --debug --config proxify.json
 ```
 
-### 3. Attach to a Running Process
-Attach the hook to a process currently running under your user account:
+### 3. Attach to Running Processes (Single PID or All PIDs by Name)
+Attach the hook to active processes running under your user session:
 ```cmd
-proxify.exe attach <PID>
+# Attach to ALL running instances of an application by executable name:
+proxify.exe attach --name telegram.exe
+proxify.exe attach -n chrome.exe
+proxify.exe attach -n firefox
+
+# Or attach to a specific PID:
+proxify.exe attach --pid 16392
 ```
+
+In the GUI (`proxify-ui`):
+- **Applications Tab**: Each app card features an **"⚡ Attach All (N running)"** button to hook all active instances with one click.
+- **Running Processes Tab**: Multi-process applications are automatically grouped with an **"⚡ Attach All (N PIDs)"** button and a top-level **"⚡ Attach All Filtered"** action.
 
 ### 4. Inspect Configuration
 ```cmd

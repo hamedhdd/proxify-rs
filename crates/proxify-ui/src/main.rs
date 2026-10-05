@@ -312,7 +312,36 @@ impl ProxifyApp {
         });
     }
 
-    fn attach_to_pid_async(&mut self, pid: u32, proc_name: String) {
+fn find_matching_pids(processes: &[ProcessItem], app_name: &str, app_path: &str) -> Vec<(u32, String)> {
+    let mut matches = Vec::new();
+    let name_lower = app_name.to_lowercase();
+    let path_file_lower = std::path::Path::new(app_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| app_path.to_lowercase());
+
+    for proc in processes {
+            let p_lower = proc.name.to_lowercase();
+            let matches_app = p_lower == name_lower
+                || p_lower == path_file_lower
+                || (p_lower.ends_with(".exe") && p_lower[..p_lower.len() - 4] == name_lower)
+                || (name_lower.ends_with(".exe") && name_lower[..name_lower.len() - 4] == p_lower)
+                || (p_lower.ends_with(".exe") && p_lower[..p_lower.len() - 4] == path_file_lower)
+                || (path_file_lower.ends_with(".exe") && path_file_lower[..path_file_lower.len() - 4] == p_lower);
+
+            if matches_app {
+                matches.push((proc.pid, proc.name.clone()));
+            }
+        }
+        matches
+    }
+
+    fn attach_to_pids_async(&mut self, targets: Vec<(u32, String)>) {
+        if targets.is_empty() {
+            self.log("No matching running processes found to attach.");
+            return;
+        }
+
         let dll_path = match find_hook_dll() {
             Ok(p) => p,
             Err(e) => {
@@ -326,7 +355,8 @@ impl ProxifyApp {
         let cfg_str = canon_cfg.to_str().unwrap_or("").to_string();
         let tx = self.log_tx.clone();
 
-        self.log(&format!("Attaching hook asynchronously to {} (PID: {})...", proc_name, pid));
+        let total = targets.len();
+        self.log(&format!("Starting batch attach to {} process instance(s)...", total));
 
         std::thread::spawn(move || {
             std::env::set_var("PROXIFY_CONFIG", &cfg_str);
@@ -337,25 +367,36 @@ impl ProxifyApp {
                 | PROCESS_VM_WRITE
                 | PROCESS_VM_READ;
 
-            unsafe {
-                let h_proc = OpenProcess(desired_access, FALSE, pid);
-                if h_proc.is_null() {
-                    let err = std::io::Error::last_os_error();
-                    let _ = tx.send(format!("✗ Failed to open PID {} ({}): {}", pid, proc_name, err));
-                    return;
-                }
+            let mut success_count = 0;
+            for (pid, proc_name) in &targets {
+                unsafe {
+                    let h_proc = OpenProcess(desired_access, FALSE, *pid);
+                    if h_proc.is_null() {
+                        let err = std::io::Error::last_os_error();
+                        let _ = tx.send(format!("✗ Failed to open PID {} ({}): {}", pid, proc_name, err));
+                        continue;
+                    }
 
-                match inject_dll(h_proc, &dll_path) {
-                    Ok(_) => {
-                        let _ = tx.send(format!("✓ Successfully attached proxy hook to {} (PID {})!", proc_name, pid));
+                    match inject_dll(h_proc, &dll_path) {
+                        Ok(_) => {
+                            let _ = tx.send(format!("✓ Successfully attached proxy hook to {} (PID {})!", proc_name, pid));
+                            success_count += 1;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(format!("✗ Failed injecting into {} (PID {}): {}", proc_name, pid, e));
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx.send(format!("✗ Failed injecting into {} (PID {}): {}", proc_name, pid, e));
-                    }
+                    CloseHandle(h_proc);
                 }
-                CloseHandle(h_proc);
             }
+
+            let _ = tx.send(format!("==> Batch attach completed: {}/{} processes successfully hooked!", success_count, total));
         });
+    }
+
+    #[allow(dead_code)]
+    fn attach_to_pid_async(&mut self, pid: u32, proc_name: String) {
+        self.attach_to_pids_async(vec![(pid, proc_name)]);
     }
 }
 
@@ -703,10 +744,14 @@ impl ProxifyApp {
 
         // Configured Apps Table
         let mut to_launch: Option<(String, String)> = None;
+        let mut to_attach_batch: Option<Vec<(u32, String)>> = None;
         let mut to_remove: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (idx, app) in self.config.apps.iter_mut().enumerate() {
+                let running_targets = Self::find_matching_pids(&self.processes, &app.name, &app.path);
+                let run_count = running_targets.len();
+
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut app.enabled, "");
@@ -735,6 +780,17 @@ impl ProxifyApp {
                             if ui.button(egui::RichText::new("🚀 Launch Proxified").color(egui::Color32::from_rgb(46, 204, 113))).clicked() {
                                 to_launch = Some((app.path.clone(), app.args.clone()));
                             }
+
+                            if run_count > 0 {
+                                let btn_text = format!("⚡ Attach All ({} running)", run_count);
+                                if ui.button(egui::RichText::new(btn_text).color(egui::Color32::from_rgb(52, 152, 219))).clicked() {
+                                    to_attach_batch = Some(running_targets);
+                                }
+                            } else {
+                                ui.add_enabled_ui(false, |ui| {
+                                    let _ = ui.button("⚡ Not running");
+                                });
+                            }
                         });
                     });
                 });
@@ -748,6 +804,10 @@ impl ProxifyApp {
 
         if let Some((path, args)) = to_launch {
             self.launch_proxied_app_async(path, args);
+        }
+
+        if let Some(targets) = to_attach_batch {
+            self.attach_to_pids_async(targets);
         }
     }
 
@@ -910,7 +970,10 @@ impl ProxifyApp {
 
         ui.horizontal(|ui| {
             ui.label("Search Process:");
-            ui.add(egui::TextEdit::singleline(&mut self.proc_search).hint_text("Type name or PID..."));
+            let search_changed = ui.add(egui::TextEdit::singleline(&mut self.proc_search).hint_text("Type name or PID...")).changed();
+            if search_changed {
+                // Keep UI snappy
+            }
 
             if ui.button("🔄 Refresh (F5 / Ctrl+R)").clicked() {
                 self.refresh_processes();
@@ -918,34 +981,75 @@ impl ProxifyApp {
             ui.label(format!("Found: {} running user processes", self.processes.len()));
         });
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
 
         let search = self.proc_search.to_lowercase();
-        let mut attach_target: Option<(u32, String)> = None;
+        let mut grouped: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+
+        for proc in &self.processes {
+            let pid_str = proc.pid.to_string();
+            if !search.is_empty() && !proc.name.to_lowercase().contains(&search) && !pid_str.contains(&search) {
+                continue;
+            }
+            grouped.entry(proc.name.clone()).or_default().push(proc.pid);
+        }
+
+        let total_matched_pids: usize = grouped.values().map(|v| v.len()).sum();
+        let mut attach_batch: Option<Vec<(u32, String)>> = None;
+
+        if !search.is_empty() && total_matched_pids > 0 {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("Matches: {} processes across {} applications", total_matched_pids, grouped.len())).color(egui::Color32::from_rgb(241, 196, 15)));
+                if ui.button(egui::RichText::new(format!("⚡ Attach All Filtered ({} PIDs)", total_matched_pids)).color(egui::Color32::from_rgb(52, 152, 219))).clicked() {
+                    let mut targets = Vec::new();
+                    for (name, pids) in &grouped {
+                        for p in pids {
+                            targets.push((*p, name.clone()));
+                        }
+                    }
+                    attach_batch = Some(targets);
+                }
+            });
+            ui.add_space(4.0);
+        }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for proc in &self.processes {
-                let pid_str = proc.pid.to_string();
-                if !search.is_empty() && !proc.name.to_lowercase().contains(&search) && !pid_str.contains(&search) {
-                    continue;
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("PID: {:<6}", proc.pid)).monospace());
-                    ui.label(egui::RichText::new(&proc.name).strong());
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⚡ Attach Proxy").clicked() {
-                            attach_target = Some((proc.pid, proc.name.clone()));
+            for (name, pids) in &grouped {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(name).strong());
+                        let count = pids.len();
+                        if count > 1 {
+                            ui.colored_label(egui::Color32::from_rgb(241, 196, 15), format!("({} instances)", count));
                         }
+
+                        let pids_preview = if count <= 4 {
+                            pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+                        } else {
+                            format!("{}, ... ({} total)", pids[..3].iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "), count)
+                        };
+                        ui.label(egui::RichText::new(format!("PIDs: [{}]", pids_preview)).monospace().color(egui::Color32::GRAY));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if count > 1 {
+                                let btn_text = format!("⚡ Attach All ({} PIDs)", count);
+                                if ui.button(egui::RichText::new(btn_text).color(egui::Color32::from_rgb(52, 152, 219))).clicked() {
+                                    let targets = pids.iter().map(|p| (*p, name.clone())).collect();
+                                    attach_batch = Some(targets);
+                                }
+                            } else if let Some(&single_pid) = pids.first() {
+                                if ui.button("⚡ Attach Proxy").clicked() {
+                                    attach_batch = Some(vec![(single_pid, name.clone())]);
+                                }
+                            }
+                        });
                     });
                 });
-                ui.separator();
             }
         });
 
-        if let Some((pid, name)) = attach_target {
-            self.attach_to_pid_async(pid, name);
+        if let Some(targets) = attach_batch {
+            self.attach_to_pids_async(targets);
         }
     }
 

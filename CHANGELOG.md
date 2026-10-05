@@ -5,6 +5,16 @@ All notable changes to `proxify-rs` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-05
+
+### Added
+- **Multi-PID & Batch Process Attachment**:
+  - **CLI `attach --name <NAME>`**: Injects the proxy hook across **all** running instances of a target application (e.g. `proxify attach --name telegram.exe` or `proxify attach -n chrome`).
+  - **Grouped Process View in UI**: The Live Process Monitor now aggregates multi-process applications (e.g. `chrome.exe (18 instances)`, `Telegram.exe (2 instances)`), displaying grouped PID chips alongside an **"⚡ Attach All (N PIDs)"** action.
+  - **"⚡ Attach All Filtered" in UI Search**: Filtering by process name or PID reveals a one-click button to attach to all matching process instances simultaneously.
+  - **App Card Attachment in Applications Tab**: Applications configured in the user's app list display a live badge (e.g. `⚡ Attach All (2 running)`) to attach all running instances without switching tabs.
+  - Asynchronous batch injector with per-PID status reporting and error recovery.
+
 ## [0.3.1] - 2026-10-05
 
 ### Fixed

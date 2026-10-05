@@ -8,8 +8,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, WAIT_FAILED};
+use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED};
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
@@ -52,10 +55,15 @@ enum Commands {
         debug: bool,
     },
 
-    /// Attach and inject proxy hook into an existing running process by PID
+    /// Attach and inject proxy hook into existing running processes by PID or Name (attaches to ALL matching PIDs)
     Attach {
         /// Process ID (PID)
-        pid: u32,
+        #[arg(short, long)]
+        pid: Option<u32>,
+
+        /// Process executable name (e.g. "telegram.exe", "firefox", "chrome") — injects into ALL matching PIDs!
+        #[arg(short, long)]
+        name: Option<String>,
 
         /// Path to custom proxify_hook.dll
         #[arg(long)]
@@ -348,7 +356,7 @@ fn main() {
             println!("==> Process {} exited.", proc_info.dwProcessId);
         }
 
-        Commands::Attach { pid, dll } => {
+        Commands::Attach { pid, name, dll } => {
             let dll_path = match find_hook_dll(dll.as_deref()) {
                 Ok(p) => p,
                 Err(err) => {
@@ -357,31 +365,53 @@ fn main() {
                 }
             };
 
-            println!("==> Attaching to PID: {}", pid);
+            let targets: Vec<(u32, String)> = match (pid, name) {
+                (Some(p), None) => vec![(p, format!("PID {}", p))],
+                (None, Some(ref n)) => {
+                    let found = find_pids_by_name(n);
+                    if found.is_empty() {
+                        eprintln!("No running processes found matching '{}'", n);
+                        std::process::exit(1);
+                    }
+                    found
+                }
+                (Some(p), Some(n)) => {
+                    println!("Attaching to explicit PID {} ({})", p, n);
+                    vec![(p, n)]
+                }
+                (None, None) => {
+                    eprintln!("Error: Please specify either --pid <PID> or --name <PROCESS_NAME> (e.g. proxify attach --name telegram.exe)");
+                    std::process::exit(1);
+                }
+            };
 
+            println!("==> Found {} target process(es) to attach:", targets.len());
             let desired_access = PROCESS_CREATE_THREAD
                 | PROCESS_QUERY_INFORMATION
                 | PROCESS_VM_OPERATION
                 | PROCESS_VM_WRITE
                 | PROCESS_VM_READ;
 
-            let h_proc = unsafe { OpenProcess(desired_access, FALSE, pid) };
-            if h_proc.is_null() {
-                eprintln!(
-                    "Failed to open process PID {} (Ensure process runs as your user): {}",
-                    pid,
-                    std::io::Error::last_os_error()
-                );
-                std::process::exit(1);
-            }
-
-            unsafe {
-                match inject_dll(h_proc, &dll_path) {
-                    Ok(_) => println!("==> Successfully injected proxify hook into PID {}", pid),
-                    Err(e) => eprintln!("Failed to inject into PID {}: {}", pid, e),
+            let mut success_count = 0;
+            for (p, proc_name) in &targets {
+                let h_proc = unsafe { OpenProcess(desired_access, FALSE, *p) };
+                if h_proc.is_null() {
+                    eprintln!("  ✗ PID {} ({}): Failed to open (Access Denied / not running): {}", p, proc_name, std::io::Error::last_os_error());
+                    continue;
                 }
-                CloseHandle(h_proc);
+
+                unsafe {
+                    match inject_dll(h_proc, &dll_path) {
+                        Ok(_) => {
+                            println!("  ✓ PID {} ({}): Injected proxify hook successfully", p, proc_name);
+                            success_count += 1;
+                        }
+                        Err(e) => eprintln!("  ✗ PID {} ({}): Injection failed: {}", p, proc_name, e),
+                    }
+                    CloseHandle(h_proc);
+                }
             }
+            println!("==> Finished: Successfully attached to {}/{} process(es).", success_count, targets.len());
         }
 
         Commands::Config { action } => match action {
@@ -514,4 +544,43 @@ fn main() {
             }
         }
     }
+}
+
+fn find_pids_by_name(name_query: &str) -> Vec<(u32, String)> {
+    let mut matches = Vec::new();
+    let q = name_query.to_lowercase();
+    let q_exe = if q.ends_with(".exe") { q.clone() } else { format!("{}.exe", q) };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return matches;
+        }
+
+        let mut entry: PROCESSENTRY32 = core::mem::zeroed();
+        entry.dwSize = core::mem::size_of::<PROCESSENTRY32>() as u32;
+
+        if Process32First(snapshot, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let bytes: Vec<u8> = entry.szExeFile[..len].iter().map(|&c| c as u8).collect();
+                let name = String::from_utf8_lossy(&bytes).to_string();
+                let name_lower = name.to_lowercase();
+
+                if (name_lower == q || name_lower == q_exe || name_lower.contains(&q)) && entry.th32ProcessID > 4 {
+                    matches.push((entry.th32ProcessID, name));
+                }
+
+                if Process32Next(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    matches
 }
