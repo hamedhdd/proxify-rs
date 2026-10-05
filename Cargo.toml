@@ -3,5 +3,6 @@ members = [
     "crates/proxify-core",
     "crates/proxify-hook",
     "crates/proxify-cli",
+    "crates/proxify-ui",
 ]
 resolver = "2"

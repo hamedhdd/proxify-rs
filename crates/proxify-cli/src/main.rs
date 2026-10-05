@@ -74,6 +74,9 @@ enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+
+    /// Launch the interactive graphical user interface (GUI)
+    Ui,
 }
 
 #[derive(Subcommand)]
@@ -379,6 +382,7 @@ fn main() {
                             target_hosts: vec!["localhost".to_string()],
                         },
                     ],
+                    apps: vec![],
                 };
 
                 match serde_json::to_string_pretty(&template) {
@@ -459,6 +463,25 @@ fn main() {
                 Err(e) => {
                     eprintln!("Failed to resolve proxy socket address: {}", e);
                 }
+            }
+        }
+
+        Commands::Ui => {
+            let mut ui_path = std::env::current_exe().unwrap_or_default();
+            ui_path.set_file_name("proxify-ui.exe");
+            if !ui_path.exists() {
+                let cand1 = PathBuf::from("target/release/proxify-ui.exe");
+                let cand2 = PathBuf::from("target/debug/proxify-ui.exe");
+                if cand1.exists() {
+                    ui_path = cand1;
+                } else if cand2.exists() {
+                    ui_path = cand2;
+                }
+            }
+            println!("==> Launching Proxify GUI: {}", ui_path.display());
+            match std::process::Command::new(&ui_path).spawn() {
+                Ok(_) => println!("==> GUI launched successfully."),
+                Err(e) => eprintln!("Failed to launch GUI binary at {}: {}", ui_path.display(), e),
             }
         }
     }

@@ -6,8 +6,9 @@
 
 ## Key Features
 
+- **Interactive Native GUI (`proxify-ui`)**: Clean desktop interface built in Rust (with egui) to visually manage proxied apps, configure IP/domain routing rules, inspect live running processes, and test proxy connectivity with 1 click.
 - **Zero Administrator Privileges**: Intercepts applications in user-mode using standard Win32 process spawning and memory injection. No UAC prompts, no driver signing, and no kernel extensions required.
-- **No PowerShell Dependency**: Runs as a standalone native binary (`proxify.exe`) interacting directly with the Windows API (`CreateProcessW`, `LoadLibraryW`, Winsock2).
+- **No PowerShell Dependency**: Runs as standalone native binaries (`proxify-ui.exe` and `proxify.exe`) interacting directly with the Windows API (`CreateProcessW`, `LoadLibraryW`, Winsock2).
 - **Rule-Based Routing**:
   - Direct vs. Proxy rules based on target IPv4 addresses, wildcard prefixes (e.g., `198.51.100.*`), ports, and hostnames.
   - Automatic loopback bypass to avoid proxy self-loops.
@@ -115,13 +116,25 @@ Example `proxify.json`:
 
 ## Usage Guide
 
-### 1. Test Proxy Connectivity
-Verify your local or remote SOCKS5 server is running and accepting connections:
+### 1. Launching the Graphical User Interface (GUI)
+Run either of the following commands:
 ```cmd
-proxify.exe test --config proxify.json
+# Launch GUI directly:
+target\release\proxify-ui.exe
+
+# Or via the CLI:
+target\release\proxify.exe ui
 ```
 
-### 2. Launch an Application with Proxify
+The GUI provides 4 tabs:
+- **📦 Applications**: Add desktop apps, specify arguments, and click **🚀 Launch Proxified** to run them with proxy hooks.
+- **🌐 Routing Rules**: Add target IP addresses, subnets (e.g. `198.51.100.*`), ports, and domains with Proxy vs. Direct actions.
+- **⚡ Running Processes**: View all active user processes and attach proxy hooks with 1 click without restarting the app.
+- **⚙ Settings**: Configure SOCKS5 proxy host/port and run live connectivity tests.
+
+---
+
+### 2. Test Proxy Connectivity (CLI)
 Run any Windows application through the proxy filter:
 ```cmd
 # Example: Launch curl with proxy hook

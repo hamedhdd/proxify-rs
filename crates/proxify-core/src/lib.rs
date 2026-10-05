@@ -20,6 +20,20 @@ pub struct Rule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub proxy_host: String,
     pub proxy_port: u16,
@@ -27,6 +41,8 @@ pub struct ProxyConfig {
     pub default_action: RuleAction,
     #[serde(default)]
     pub rules: Vec<Rule>,
+    #[serde(default)]
+    pub apps: Vec<AppConfig>,
 }
 
 fn default_action_direct() -> RuleAction {
@@ -46,6 +62,14 @@ impl Default for ProxyConfig {
                     target_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
                     target_ports: vec![],
                     target_hosts: vec!["localhost".to_string()],
+                },
+            ],
+            apps: vec![
+                AppConfig {
+                    name: "Command Prompt / Curl".to_string(),
+                    path: "curl.exe".to_string(),
+                    args: "https://api.myip.com".to_string(),
+                    enabled: true,
                 },
             ],
         }
