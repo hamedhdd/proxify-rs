@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED};
@@ -61,16 +62,30 @@ struct ProxifyApp {
     new_rule_hosts: String,
     new_rule_action: RuleAction,
 
-    // Process monitor
-    processes: Vec<ProcessItem>,
+    // Search filters
+    rule_search: String,
     proc_search: String,
 
-    // Log messages
+    // Confirm-on-delete state
+    confirm_delete_app: Option<usize>,
+    confirm_delete_rule: Option<usize>,
+
+    // Theme state
+    is_dark_theme: bool,
+
+    // Process monitor
+    processes: Vec<ProcessItem>,
+
+    // Async background task communication
+    log_tx: Sender<String>,
+    log_rx: Receiver<String>,
+
+    // Activity log entries
     logs: Vec<String>,
 }
 
 impl ProxifyApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = PathBuf::from("proxify.json");
         let config = if config_path.exists() {
             fs::read_to_string(&config_path)
@@ -80,6 +95,15 @@ impl ProxifyApp {
         } else {
             ProxyConfig::default()
         };
+
+        let is_dark_theme = config.theme.as_deref().unwrap_or("dark") != "light";
+        if is_dark_theme {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
+        }
+
+        let (log_tx, log_rx) = channel();
 
         let mut app = Self {
             config,
@@ -95,8 +119,14 @@ impl ProxifyApp {
             new_rule_ports: String::new(),
             new_rule_hosts: String::new(),
             new_rule_action: RuleAction::Proxy,
-            processes: Vec::new(),
+            rule_search: String::new(),
             proc_search: String::new(),
+            confirm_delete_app: None,
+            confirm_delete_rule: None,
+            is_dark_theme,
+            processes: Vec::new(),
+            log_tx,
+            log_rx,
             logs: vec!["Proxify UI initialized. Ready to control apps and routes.".to_string()],
         };
 
@@ -107,12 +137,18 @@ impl ProxifyApp {
     fn log(&mut self, msg: &str) {
         let time_str = chrono_format_now();
         self.logs.push(format!("[{}] {}", time_str, msg));
-        if self.logs.len() > 100 {
+        if self.logs.len() > 150 {
             self.logs.remove(0);
         }
     }
 
     fn save_config(&mut self) {
+        self.config.theme = Some(if self.is_dark_theme {
+            "dark".to_string()
+        } else {
+            "light".to_string()
+        });
+
         if let Ok(json) = serde_json::to_string_pretty(&self.config) {
             if let Err(e) = fs::write(&self.config_path, json) {
                 self.log(&format!("Failed to save config: {}", e));
@@ -128,153 +164,190 @@ impl ProxifyApp {
 
     fn test_proxy_connection(&mut self) {
         let target = format!("{}:{}", self.config.proxy_host, self.config.proxy_port);
-        match target.to_socket_addrs() {
-            Ok(mut addrs) => {
-                if let Some(addr) = addrs.next() {
-                    match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-                        Ok(mut stream) => {
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                            let greeting = socks5::build_greeting();
-                            let _ = stream.write_all(&greeting);
+        let username = self.config.proxy_username.clone();
+        let password = self.config.proxy_password.clone();
+        let tx = self.log_tx.clone();
 
-                            let mut resp = [0u8; 2];
-                            if stream.read_exact(&mut resp).is_ok()
-                                && socks5::verify_greeting_response(&resp)
-                            {
-                                self.test_status = Some("Proxy Online & Ready (Handshake OK)".to_string());
-                                self.test_success = true;
-                                self.log(&format!("SOCKS5 proxy at {} is reachable and responsive.", target));
-                            } else {
-                                self.test_status = Some("Proxy reachable, handshake rejected".to_string());
-                                self.test_success = false;
-                                self.log("Proxy reachable but handshake failed.");
+        self.log(&format!("Testing connection to SOCKS5 proxy at {}...", target));
+
+        // Perform test asynchronously so UI never hangs
+        std::thread::spawn(move || {
+            match target.to_socket_addrs() {
+                Ok(mut addrs) => {
+                    if let Some(addr) = addrs.next() {
+                        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                            Ok(mut stream) => {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                                let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+
+                                let has_auth = username.is_some() && password.is_some();
+                                let greeting = socks5::build_greeting_methods(has_auth);
+                                if stream.write_all(&greeting).is_err() {
+                                    let _ = tx.send("Error: Failed to send SOCKS5 greeting.".to_string());
+                                    return;
+                                }
+
+                                let mut resp = [0u8; 2];
+                                if stream.read_exact(&mut resp).is_err() || resp[0] != socks5::SOCKS_VERSION {
+                                    let _ = tx.send("Error: Proxy rejected greeting or returned invalid version.".to_string());
+                                    return;
+                                }
+
+                                if resp[1] == socks5::AUTH_USER_PASS {
+                                    if let (Some(u), Some(p)) = (username, password) {
+                                        let auth_req = socks5::build_auth_request(&u, &p);
+                                        let _ = stream.write_all(&auth_req);
+                                        let mut auth_resp = [0u8; 2];
+                                        if stream.read_exact(&mut auth_resp).is_ok() && socks5::verify_auth_response(&auth_resp) {
+                                            let _ = tx.send(format!("✓ Proxy at {} is ONLINE and AUTHENTICATED (User/Pass OK)!", target));
+                                        } else {
+                                            let _ = tx.send("✗ Proxy reached, but authentication was rejected by the server!".to_string());
+                                        }
+                                    } else {
+                                        let _ = tx.send("✗ Proxy requires authentication, but no credentials configured.".to_string());
+                                    }
+                                } else if resp[1] == socks5::AUTH_NONE {
+                                    let _ = tx.send(format!("✓ Proxy at {} is ONLINE (No Authentication required)!", target));
+                                } else {
+                                    let _ = tx.send(format!("✗ Proxy selected unsupported authentication method code: 0x{:02X}", resp[1]));
+                                }
                             }
-                        }
-                        Err(e) => {
-                            self.test_status = Some(format!("Connection Failed: {}", e));
-                            self.test_success = false;
-                            self.log(&format!("Could not connect to SOCKS5 proxy: {}", e));
+                            Err(e) => {
+                                let _ = tx.send(format!("✗ Could not connect to SOCKS5 proxy at {}: {}", target, e));
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                self.test_status = Some(format!("Invalid Address: {}", e));
-                self.test_success = false;
-            }
-        }
-    }
-
-    fn launch_proxied_app(&mut self, app_path: &str, app_args: &str) {
-        let dll_path = match find_hook_dll() {
-            Ok(p) => p,
-            Err(e) => {
-                self.log(&format!("Error: {}", e));
-                return;
-            }
-        };
-
-        // Ensure config is saved
-        self.save_config();
-
-        let canon_cfg = self.config_path.canonicalize().unwrap_or(self.config_path.clone());
-        std::env::set_var("PROXIFY_CONFIG", canon_cfg.to_str().unwrap_or(""));
-
-        let mut cmd_str = format!("\"{}\"", app_path);
-        if !app_args.trim().is_empty() {
-            cmd_str.push(' ');
-            cmd_str.push_str(app_args.trim());
-        }
-
-        self.log(&format!("Spawning suspended process: {}", cmd_str));
-
-        let mut cmd_wide: Vec<u16> = OsStr::new(&cmd_str)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        unsafe {
-            let mut startup_info: STARTUPINFOW = core::mem::zeroed();
-            startup_info.cb = core::mem::size_of::<STARTUPINFOW>() as u32;
-            let mut proc_info: PROCESS_INFORMATION = core::mem::zeroed();
-
-            let ok = CreateProcessW(
-                core::ptr::null(),
-                cmd_wide.as_mut_ptr(),
-                core::ptr::null(),
-                core::ptr::null(),
-                FALSE,
-                CREATE_SUSPENDED,
-                core::ptr::null(),
-                core::ptr::null(),
-                &mut startup_info,
-                &mut proc_info,
-            );
-
-            if ok == 0 {
-                let err = std::io::Error::last_os_error();
-                self.log(&format!("CreateProcessW failed for {}: {}", app_path, err));
-                return;
-            }
-
-            let pid = proc_info.dwProcessId;
-            self.log(&format!("Process created with PID {}. Injecting hook...", pid));
-
-            if let Err(e) = inject_dll(proc_info.hProcess, &dll_path) {
-                self.log(&format!("DLL injection error: {}", e));
-            } else {
-                self.log(&format!("Successfully hooked process PID {}! Resuming execution...", pid));
-            }
-
-            ResumeThread(proc_info.hThread);
-            CloseHandle(proc_info.hThread);
-            CloseHandle(proc_info.hProcess);
-        }
-    }
-
-    fn attach_to_pid(&mut self, pid: u32, proc_name: &str) {
-        let dll_path = match find_hook_dll() {
-            Ok(p) => p,
-            Err(e) => {
-                self.log(&format!("Error: {}", e));
-                return;
-            }
-        };
-
-        self.save_config();
-        let canon_cfg = self.config_path.canonicalize().unwrap_or(self.config_path.clone());
-        std::env::set_var("PROXIFY_CONFIG", canon_cfg.to_str().unwrap_or(""));
-
-        let desired_access = PROCESS_CREATE_THREAD
-            | PROCESS_QUERY_INFORMATION
-            | PROCESS_VM_OPERATION
-            | PROCESS_VM_WRITE
-            | PROCESS_VM_READ;
-
-        unsafe {
-            let h_proc = OpenProcess(desired_access, FALSE, pid);
-            if h_proc.is_null() {
-                let err = std::io::Error::last_os_error();
-                self.log(&format!("Failed to open PID {} ({}): {}", pid, proc_name, err));
-                return;
-            }
-
-            match inject_dll(h_proc, &dll_path) {
-                Ok(_) => {
-                    self.log(&format!("Successfully attached proxy hook to {} (PID {})!", proc_name, pid));
-                }
                 Err(e) => {
-                    self.log(&format!("Failed injecting into {} (PID {}): {}", proc_name, pid, e));
+                    let _ = tx.send(format!("✗ Failed to resolve proxy address: {}", e));
                 }
             }
-            CloseHandle(h_proc);
-        }
+        });
+    }
+
+    fn launch_proxied_app_async(&mut self, app_path: String, app_args: String) {
+        let dll_path = match find_hook_dll() {
+            Ok(p) => p,
+            Err(e) => {
+                self.log(&format!("Error: {}", e));
+                return;
+            }
+        };
+
+        self.save_config();
+
+        let canon_cfg = self.config_path.canonicalize().unwrap_or(self.config_path.clone());
+        let cfg_str = canon_cfg.to_str().unwrap_or("").to_string();
+        let tx = self.log_tx.clone();
+
+        self.log(&format!("Launching application asynchronously: {} {}", app_path, app_args));
+
+        // Spawn background thread so UI never freezes during suspended launch and injection
+        std::thread::spawn(move || {
+            std::env::set_var("PROXIFY_CONFIG", &cfg_str);
+
+            let mut cmd_str = format!("\"{}\"", app_path);
+            if !app_args.trim().is_empty() {
+                cmd_str.push(' ');
+                cmd_str.push_str(app_args.trim());
+            }
+
+            let mut cmd_wide: Vec<u16> = OsStr::new(&cmd_str)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            unsafe {
+                let mut startup_info: STARTUPINFOW = core::mem::zeroed();
+                startup_info.cb = core::mem::size_of::<STARTUPINFOW>() as u32;
+                let mut proc_info: PROCESS_INFORMATION = core::mem::zeroed();
+
+                let ok = CreateProcessW(
+                    core::ptr::null(),
+                    cmd_wide.as_mut_ptr(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    FALSE,
+                    CREATE_SUSPENDED,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    &mut startup_info,
+                    &mut proc_info,
+                );
+
+                if ok == 0 {
+                    let err = std::io::Error::last_os_error();
+                    let _ = tx.send(format!("✗ CreateProcessW failed for '{}': {}", app_path, err));
+                    return;
+                }
+
+                let pid = proc_info.dwProcessId;
+                let _ = tx.send(format!("==> Target process created suspended (PID: {}). Injecting hook...", pid));
+
+                match inject_dll(proc_info.hProcess, &dll_path) {
+                    Ok(_) => {
+                        let _ = tx.send(format!("✓ Hook successfully injected into PID {}! Resuming execution...", pid));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("✗ DLL injection failed for PID {}: {}", pid, e));
+                    }
+                }
+
+                ResumeThread(proc_info.hThread);
+                CloseHandle(proc_info.hThread);
+                CloseHandle(proc_info.hProcess);
+            }
+        });
+    }
+
+    fn attach_to_pid_async(&mut self, pid: u32, proc_name: String) {
+        let dll_path = match find_hook_dll() {
+            Ok(p) => p,
+            Err(e) => {
+                self.log(&format!("Error: {}", e));
+                return;
+            }
+        };
+
+        self.save_config();
+        let canon_cfg = self.config_path.canonicalize().unwrap_or(self.config_path.clone());
+        let cfg_str = canon_cfg.to_str().unwrap_or("").to_string();
+        let tx = self.log_tx.clone();
+
+        self.log(&format!("Attaching hook asynchronously to {} (PID: {})...", proc_name, pid));
+
+        std::thread::spawn(move || {
+            std::env::set_var("PROXIFY_CONFIG", &cfg_str);
+
+            let desired_access = PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ;
+
+            unsafe {
+                let h_proc = OpenProcess(desired_access, FALSE, pid);
+                if h_proc.is_null() {
+                    let err = std::io::Error::last_os_error();
+                    let _ = tx.send(format!("✗ Failed to open PID {} ({}): {}", pid, proc_name, err));
+                    return;
+                }
+
+                match inject_dll(h_proc, &dll_path) {
+                    Ok(_) => {
+                        let _ = tx.send(format!("✓ Successfully attached proxy hook to {} (PID {})!", proc_name, pid));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("✗ Failed injecting into {} (PID {}): {}", proc_name, pid, e));
+                    }
+                }
+                CloseHandle(h_proc);
+            }
+        });
     }
 }
 
 fn chrono_format_now() -> String {
-    // Simple timestamp without external chrono dependency
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -429,15 +502,39 @@ fn list_running_processes() -> Vec<ProcessItem> {
 
 impl eframe::App for ProxifyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Top Menu / Header
+        // Drain asynchronous background task logs
+        while let Ok(msg) = self.log_rx.try_recv() {
+            self.log(&msg);
+            if msg.starts_with('✓') {
+                self.test_status = Some("Online".to_string());
+                self.test_success = true;
+            } else if msg.starts_with('✗') {
+                self.test_status = Some("Failed".to_string());
+                self.test_success = false;
+            }
+        }
+
+        // Handle Global Keyboard Shortcuts
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S)) {
+            self.save_config();
+        }
+        if ctx.input(|i| (i.modifiers.ctrl && i.key_pressed(egui::Key::R)) || i.key_pressed(egui::Key::F5)) {
+            self.refresh_processes();
+            self.log("Refreshed running processes list.");
+        }
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::T)) {
+            self.test_proxy_connection();
+        }
+
+        // Top Menu / Header Panel
         egui::TopBottomPanel::top("header_panel").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("🛡 Proxify-RS");
-                ui.label(egui::RichText::new("User-Mode Application Proxy Manager").color(egui::Color32::GRAY));
+                ui.label(egui::RichText::new("User-Mode App Proxy Manager").color(egui::Color32::GRAY));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("💾 Save Config").clicked() {
+                    if ui.button("💾 Save (Ctrl+S)").clicked() {
                         self.save_config();
                     }
 
@@ -447,10 +544,10 @@ impl eframe::App for ProxifyApp {
                         } else {
                             egui::Color32::from_rgb(231, 76, 60)
                         };
-                        ui.colored_label(color, status);
+                        ui.colored_label(color, format!("● {}", status));
                     }
 
-                    if ui.button("🔍 Test Proxy").clicked() {
+                    if ui.button("🔍 Test Proxy (Ctrl+T)").clicked() {
                         self.test_proxy_connection();
                     }
 
@@ -459,7 +556,7 @@ impl eframe::App for ProxifyApp {
             });
             ui.add_space(4.0);
 
-            // Tab bar
+            // Navigation Tab bar
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Applications, "📦 Applications");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Rules, "🌐 Routing Rules");
@@ -472,28 +569,35 @@ impl eframe::App for ProxifyApp {
         // Bottom log panel
         egui::TopBottomPanel::bottom("log_panel")
             .resizable(true)
-            .default_height(100.0)
+            .default_height(110.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Activity Log").strong());
-                    if ui.button("Clear").clicked() {
+                    if ui.button("Clear Log").clicked() {
                         self.logs.clear();
                     }
                 });
                 egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                     for entry in &self.logs {
-                        ui.label(egui::RichText::new(entry).monospace().size(11.0));
+                        let color = if entry.contains('✓') || entry.contains("successfully") {
+                            egui::Color32::from_rgb(46, 204, 113)
+                        } else if entry.contains('✗') || entry.contains("failed") || entry.contains("Error") {
+                            egui::Color32::from_rgb(231, 76, 60)
+                        } else {
+                            ui.style().visuals.text_color()
+                        };
+                        ui.colored_label(color, egui::RichText::new(entry).monospace().size(11.0));
                     }
                 });
             });
 
-        // Main Central Content
+        // Main Central Content Area
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.active_tab {
                 ActiveTab::Applications => self.render_applications_tab(ui),
                 ActiveTab::Rules => self.render_rules_tab(ui),
                 ActiveTab::RunningProcesses => self.render_processes_tab(ui),
-                ActiveTab::Settings => self.render_settings_tab(ui),
+                ActiveTab::Settings => self.render_settings_tab(ui, ctx),
             }
         });
     }
@@ -502,21 +606,42 @@ impl eframe::App for ProxifyApp {
 impl ProxifyApp {
     fn render_applications_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Control Proxified Applications");
-        ui.label("Configure target desktop applications to intercept and route through your proxy.");
+        ui.label("Configure desktop applications to intercept and route through your proxy without admin rights.");
         ui.add_space(8.0);
 
-        // Add application box
+        // Add application box with native file picker
         ui.group(|ui| {
             ui.label(egui::RichText::new("Add Application").strong());
             ui.horizontal(|ui| {
                 ui.label("Name:");
-                ui.text_edit_singleline(&mut self.new_app_name);
-                ui.label("Executable Path:");
-                ui.text_edit_singleline(&mut self.new_app_path);
-                ui.label("Args:");
-                ui.text_edit_singleline(&mut self.new_app_args);
+                ui.add(egui::TextEdit::singleline(&mut self.new_app_name).hint_text("e.g. Telegram"));
 
-                if ui.button("➕ Add App").clicked() {
+                ui.label("Executable Path:");
+                ui.add(egui::TextEdit::singleline(&mut self.new_app_path).hint_text("C:\\Path\\To\\App.exe"));
+
+                // U1: Native File Picker using rfd
+                if ui.button("📁 Browse...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Select Application Executable")
+                        .add_filter("Executable Files", &["exe", "bat", "cmd"])
+                        .pick_file()
+                    {
+                        let path_str = path.to_string_lossy().to_string();
+                        if self.new_app_name.trim().is_empty() {
+                            if let Some(stem) = path.file_stem() {
+                                self.new_app_name = stem.to_string_lossy().to_string();
+                            }
+                        }
+                        self.new_app_path = path_str;
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Arguments (optional):");
+                ui.add(egui::TextEdit::singleline(&mut self.new_app_args).hint_text("e.g. --profile work"));
+
+                if ui.button("➕ Add App to List").clicked() {
                     if !self.new_app_path.trim().is_empty() {
                         let name = if self.new_app_name.trim().is_empty() {
                             self.new_app_path.clone()
@@ -540,7 +665,7 @@ impl ProxifyApp {
 
         ui.add_space(8.0);
 
-        // Apps List Table
+        // Configured Apps Table
         let mut to_launch: Option<(String, String)> = None;
         let mut to_remove: Option<usize> = None;
 
@@ -556,8 +681,19 @@ impl ProxifyApp {
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("🗑 Remove").clicked() {
-                                to_remove = Some(idx);
+                            // Confirm-on-delete check
+                            if self.confirm_delete_app == Some(idx) {
+                                if ui.button(egui::RichText::new("Yes, Delete").color(egui::Color32::RED)).clicked() {
+                                    to_remove = Some(idx);
+                                    self.confirm_delete_app = None;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.confirm_delete_app = None;
+                                }
+                            } else {
+                                if ui.button("🗑 Remove").clicked() {
+                                    self.confirm_delete_app = Some(idx);
+                                }
                             }
 
                             if ui.button(egui::RichText::new("🚀 Launch Proxified").color(egui::Color32::from_rgb(46, 204, 113))).clicked() {
@@ -575,38 +711,42 @@ impl ProxifyApp {
         }
 
         if let Some((path, args)) = to_launch {
-            self.launch_proxied_app(&path, &args);
+            self.launch_proxied_app_async(path, args);
         }
     }
 
     fn render_rules_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Address & Port Routing Rules");
-        ui.label("Control which target IP addresses, subnets, and ports go through the proxy vs. direct.");
+        ui.label("Define which target IP addresses, subnets, and ports route through proxy vs. connect direct.");
         ui.add_space(8.0);
 
-        // Default Action Selection
+        // Default Action selection
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Default Action for unmatched traffic:").strong());
+            ui.label(egui::RichText::new("Default Action (for unmatched traffic):").strong());
             ui.radio_value(&mut self.config.default_action, RuleAction::Direct, "Direct (Bypass Proxy)");
             ui.radio_value(&mut self.config.default_action, RuleAction::Proxy, "Proxy (Route through Proxy)");
         });
 
         ui.add_space(8.0);
 
-        // Add Rule Section
+        // Add Rule Form
         ui.group(|ui| {
             ui.label(egui::RichText::new("Add New Routing Rule").strong());
             ui.horizontal(|ui| {
                 ui.label("Rule Name:");
-                ui.text_edit_singleline(&mut self.new_rule_name);
-                ui.label("Target IPs/Subnets (comma separated):");
-                ui.text_edit_singleline(&mut self.new_rule_ips);
+                ui.add(egui::TextEdit::singleline(&mut self.new_rule_name).hint_text("e.g. Work Subnet"));
+
+                ui.label("Target IPs / Subnets:");
+                ui.add(egui::TextEdit::singleline(&mut self.new_rule_ips).hint_text("198.51.100.*, 203.0.113.10"));
             });
+
             ui.horizontal(|ui| {
-                ui.label("Target Ports (e.g. 80, 443):");
-                ui.text_edit_singleline(&mut self.new_rule_ports);
-                ui.label("Domains (e.g. *.example.com):");
-                ui.text_edit_singleline(&mut self.new_rule_hosts);
+                ui.label("Target Ports:");
+                ui.add(egui::TextEdit::singleline(&mut self.new_rule_ports).hint_text("80, 443 (blank = any)"));
+
+                ui.label("Target Hosts:");
+                ui.add(egui::TextEdit::singleline(&mut self.new_rule_hosts).hint_text("*.corp.example.com"));
+
                 ui.label("Action:");
                 egui::ComboBox::from_id_salt("rule_action_combo")
                     .selected_text(match self.new_rule_action {
@@ -655,10 +795,32 @@ impl ProxifyApp {
 
         ui.add_space(8.0);
 
+        // Search / Filter Rules box
+        ui.horizontal(|ui| {
+            ui.label("Filter Rules:");
+            ui.add(egui::TextEdit::singleline(&mut self.rule_search).hint_text("Search by name, IP, port, host..."));
+            if ui.button("Clear").clicked() {
+                self.rule_search.clear();
+            }
+        });
+
+        ui.add_space(4.0);
+
         // Rules List
-        let mut remove_idx: Option<usize> = None;
+        let mut remove_rule_idx: Option<usize> = None;
+        let query = self.rule_search.to_lowercase();
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (idx, rule) in self.config.rules.iter_mut().enumerate() {
+                if !query.is_empty() {
+                    let matches_name = rule.name.to_lowercase().contains(&query);
+                    let matches_ips = rule.target_ips.iter().any(|ip| ip.to_lowercase().contains(&query));
+                    let matches_hosts = rule.target_hosts.iter().any(|h| h.to_lowercase().contains(&query));
+                    if !matches_name && !matches_ips && !matches_hosts {
+                        continue;
+                    }
+                }
+
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         let action_color = match rule.action {
@@ -679,8 +841,18 @@ impl ProxifyApp {
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("🗑 Delete").clicked() {
-                                remove_idx = Some(idx);
+                            if self.confirm_delete_rule == Some(idx) {
+                                if ui.button(egui::RichText::new("Yes, Delete").color(egui::Color32::RED)).clicked() {
+                                    remove_rule_idx = Some(idx);
+                                    self.confirm_delete_rule = None;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.confirm_delete_rule = None;
+                                }
+                            } else {
+                                if ui.button("🗑 Delete").clicked() {
+                                    self.confirm_delete_rule = Some(idx);
+                                }
                             }
                         });
                     });
@@ -688,7 +860,7 @@ impl ProxifyApp {
             }
         });
 
-        if let Some(idx) = remove_idx {
+        if let Some(idx) = remove_rule_idx {
             self.config.rules.remove(idx);
             self.save_config();
         }
@@ -696,16 +868,17 @@ impl ProxifyApp {
 
     fn render_processes_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Live Process Monitor");
-        ui.label("Attach proxy hooks directly into running applications owned by your user session.");
+        ui.label("Attach proxy hooks directly into running applications without restarting them.");
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
             ui.label("Search Process:");
-            ui.text_edit_singleline(&mut self.proc_search);
-            if ui.button("🔄 Refresh Processes").clicked() {
+            ui.add(egui::TextEdit::singleline(&mut self.proc_search).hint_text("Type name or PID..."));
+
+            if ui.button("🔄 Refresh (F5 / Ctrl+R)").clicked() {
                 self.refresh_processes();
             }
-            ui.label(format!("Found: {} processes", self.processes.len()));
+            ui.label(format!("Found: {} running user processes", self.processes.len()));
         });
 
         ui.add_space(8.0);
@@ -715,7 +888,8 @@ impl ProxifyApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for proc in &self.processes {
-                if !search.is_empty() && !proc.name.to_lowercase().contains(&search) {
+                let pid_str = proc.pid.to_string();
+                if !search.is_empty() && !proc.name.to_lowercase().contains(&search) && !pid_str.contains(&search) {
                     continue;
                 }
 
@@ -734,19 +908,21 @@ impl ProxifyApp {
         });
 
         if let Some((pid, name)) = attach_target {
-            self.attach_to_pid(pid, &name);
+            self.attach_to_pid_async(pid, name);
         }
     }
 
-    fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Proxy Server Configuration");
+    fn render_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Settings & Proxy Configuration");
         ui.add_space(8.0);
 
+        // SOCKS5 Configuration Box
         ui.group(|ui| {
             ui.label(egui::RichText::new("SOCKS5 Proxy Server").strong());
             ui.horizontal(|ui| {
                 ui.label("Host:");
                 ui.text_edit_singleline(&mut self.config.proxy_host);
+
                 ui.label("Port:");
                 let mut port_str = self.config.proxy_port.to_string();
                 if ui.text_edit_singleline(&mut port_str).changed() {
@@ -757,18 +933,68 @@ impl ProxifyApp {
             });
 
             ui.add_space(4.0);
-            if ui.button("Save Settings").clicked() {
-                self.save_config();
+            ui.label(egui::RichText::new("Optional Authentication (RFC 1929)").strong());
+            ui.horizontal(|ui| {
+                ui.label("Username:");
+                let mut user = self.config.proxy_username.clone().unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut user).hint_text("Leave blank if none")).changed() {
+                    self.config.proxy_username = if user.trim().is_empty() { None } else { Some(user.trim().to_string()) };
+                }
+
+                ui.label("Password:");
+                let mut pass = self.config.proxy_password.clone().unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut pass).password(true).hint_text("Leave blank if none")).changed() {
+                    self.config.proxy_password = if pass.trim().is_empty() { None } else { Some(pass.trim().to_string()) };
+                }
+            });
+
+            ui.add_space(6.0);
+            if ui.button("🔍 Test Proxy Connection").clicked() {
+                self.test_proxy_connection();
             }
         });
+
+        ui.add_space(8.0);
+
+        // UI Appearance Box
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Appearance & Theme").strong());
+            ui.horizontal(|ui| {
+                if ui.radio(self.is_dark_theme, "🌙 Dark Theme").clicked() {
+                    self.is_dark_theme = true;
+                    ctx.set_visuals(egui::Visuals::dark());
+                    self.save_config();
+                }
+                if ui.radio(!self.is_dark_theme, "☀️ Light Theme").clicked() {
+                    self.is_dark_theme = false;
+                    ctx.set_visuals(egui::Visuals::light());
+                    self.save_config();
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // Shortcuts Summary Box
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Keyboard Shortcuts").strong());
+            ui.label("• Ctrl+S: Save configuration to proxify.json");
+            ui.label("• Ctrl+R / F5: Refresh active processes list");
+            ui.label("• Ctrl+T: Test connection to SOCKS5 proxy server");
+        });
+
+        ui.add_space(8.0);
+        if ui.button("💾 Save All Settings").clicked() {
+            self.save_config();
+        }
     }
 }
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 620.0])
-            .with_min_inner_size([650.0, 450.0])
+            .with_inner_size([900.0, 640.0])
+            .with_min_inner_size([680.0, 480.0])
             .with_title("Proxify-RS — User-Mode App Proxy Manager"),
         ..Default::default()
     };

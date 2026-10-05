@@ -162,24 +162,47 @@ unsafe fn perform_socks5_handshake(
     s: SOCKET,
     target_ip: [u8; 4],
     target_port: u16,
+    cfg: &ProxyConfig,
 ) -> Result<(), i32> {
-    // 1. Send client greeting: SOCKS5, 1 auth method, NO AUTH (0x00)
-    let greeting = socks5::build_greeting();
+    // 1. Send client greeting with optional username/password auth method
+    let has_auth = cfg.proxy_username.is_some() && cfg.proxy_password.is_some();
+    let greeting = socks5::build_greeting_methods(has_auth);
     send_all(s, &greeting)?;
 
-    // 2. Expect server greeting response: [0x05, 0x00]
+    // 2. Expect server greeting response: [0x05, METHOD]
     let mut greet_resp = [0u8; 2];
     recv_exact(s, &mut greet_resp)?;
-    if !socks5::verify_greeting_response(&greet_resp) {
-        log_msg("SOCKS5 greeting response rejected or requires authentication");
+    if greet_resp[0] != socks5::SOCKS_VERSION {
+        log_msg("Invalid SOCKS version in server greeting response");
         return Err(WSAECONNREFUSED as i32);
     }
 
-    // 3. Send SOCKS5 CONNECT command for target IPv4
+    // 3. Handle auth if requested by server
+    if greet_resp[1] == socks5::AUTH_USER_PASS {
+        if let (Some(ref u), Some(ref p)) = (&cfg.proxy_username, &cfg.proxy_password) {
+            let auth_req = socks5::build_auth_request(u, p);
+            send_all(s, &auth_req)?;
+            let mut auth_resp = [0u8; 2];
+            recv_exact(s, &mut auth_resp)?;
+            if !socks5::verify_auth_response(&auth_resp) {
+                log_msg("SOCKS5 username/password authentication failed!");
+                return Err(WSAECONNREFUSED as i32);
+            }
+            log_msg("SOCKS5 authentication succeeded");
+        } else {
+            log_msg("Server requested username/password, but none configured");
+            return Err(WSAECONNREFUSED as i32);
+        }
+    } else if greet_resp[1] != socks5::AUTH_NONE {
+        log_msg(&format!("SOCKS5 greeting rejected or requested unsupported method: {}", greet_resp[1]));
+        return Err(WSAECONNREFUSED as i32);
+    }
+
+    // 4. Send SOCKS5 CONNECT command for target IPv4
     let connect_req = socks5::build_connect_ipv4(target_ip, target_port);
     send_all(s, &connect_req)?;
 
-    // 4. Read response header: [VER, REP, RSV, ATYP]
+    // 5. Read response header: [VER, REP, RSV, ATYP]
     let mut resp_header = [0u8; 4];
     recv_exact(s, &mut resp_header)?;
     if resp_header[0] != socks5::SOCKS_VERSION || resp_header[1] != socks5::REP_SUCCESS {
@@ -187,7 +210,7 @@ unsafe fn perform_socks5_handshake(
         return Err(WSAECONNREFUSED as i32);
     }
 
-    // 5. Drain the bound address based on ATYP
+    // 6. Drain the bound address based on ATYP
     match resp_header[3] {
         socks5::ATYP_IPV4 => {
             let mut drain = [0u8; 6]; // 4 bytes IP + 2 bytes port
@@ -271,7 +294,7 @@ unsafe fn handle_proxy_connect(
     }
 
     // Now complete SOCKS5 tunnel handshake
-    match perform_socks5_handshake(s, target_ip_bytes, target_port) {
+    match perform_socks5_handshake(s, target_ip_bytes, target_port, cfg) {
         Ok(_) => {
             log_msg(&format!("Successfully tunneled to {}:{}!", target_ip_str, target_port));
             0

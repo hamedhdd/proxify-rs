@@ -365,6 +365,9 @@ fn main() {
                 let template = ProxyConfig {
                     proxy_host: "127.0.0.1".to_string(),
                     proxy_port: 1080,
+                    proxy_username: None,
+                    proxy_password: None,
+                    theme: Some("dark".to_string()),
                     default_action: RuleAction::Direct,
                     rules: vec![
                         Rule {

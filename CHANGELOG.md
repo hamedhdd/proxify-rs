@@ -5,6 +5,20 @@ All notable changes to `proxify-rs` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-05
+
+### Added
+- **Native File Picker (`rfd`)**: "📁 Browse..." button to easily select target application `.exe` binaries with automatic path and name detection.
+- **Asynchronous Non-blocking Operations**: Background worker threads with `mpsc` channel communication for application launching, suspended process injection, and live process attaching, eliminating UI thread freezes.
+- **SOCKS5 Username/Password Authentication (RFC 1929)**: Subnegotiation support in `proxify-core` and in-flight hook `proxify-hook`, with credential fields in the Settings UI and live auth probe in Test Proxy.
+- **Confirm-on-Delete Safety**: Two-step confirmation for removing applications and routing rules to prevent accidental deletions.
+- **Appearance & Theme Switcher**: Dark / Light theme switcher persisted to `proxify.json`.
+- **Keyboard Shortcuts**: `Ctrl+S` (Save), `Ctrl+R` / `F5` (Refresh processes), `Ctrl+T` (Test proxy).
+- **Rule Search & Filtering**: Real-time filter box in the Routing Rules tab.
+
+### Fixed
+- **Terminal Console Window Suppression**: Added `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` to silence the companion black console window in release GUI builds.
+
 ## [0.2.0] - 2026-10-05
 
 ### Added

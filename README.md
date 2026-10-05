@@ -6,13 +6,15 @@
 
 ## Key Features
 
-- **Interactive Native GUI (`proxify-ui`)**: Clean desktop interface built in Rust (with egui) to visually manage proxied apps, configure IP/domain routing rules, inspect live running processes, and test proxy connectivity with 1 click.
+- **Interactive Native GUI (`proxify-ui`)**: Clean desktop interface built in Rust (with egui) to visually manage proxied apps, configure IP/domain routing rules, inspect live running processes, and test proxy connectivity with 1 click. Console window is automatically suppressed in release builds.
+- **Native File Dialog**: Integrated `rfd` file picker to browse and select `.exe` applications without manual path entry.
+- **Asynchronous & Non-Blocking**: Process launching, suspended DLL injection, and active process attaching run in background threads via `mpsc` channels with zero UI freeze.
+- **SOCKS5 with RFC 1929 Authentication**: Supports both unauthenticated proxies and username/password credentials in configuration and in-flight handshakes.
 - **Zero Administrator Privileges**: Intercepts applications in user-mode using standard Win32 process spawning and memory injection. No UAC prompts, no driver signing, and no kernel extensions required.
 - **No PowerShell Dependency**: Runs as standalone native binaries (`proxify-ui.exe` and `proxify.exe`) interacting directly with the Windows API (`CreateProcessW`, `LoadLibraryW`, Winsock2).
 - **Rule-Based Routing**:
   - Direct vs. Proxy rules based on target IPv4 addresses, wildcard prefixes (e.g., `198.51.100.*`), ports, and hostnames.
   - Automatic loopback bypass to avoid proxy self-loops.
-- **SOCKS5 Protocol Tunneling**: Handshakes transparently with SOCKS5 proxies on intercepted Winsock `connect` and `WSAConnect` calls.
 - **Two Operation Modes**:
   - `run`: Spawns a target process suspended, injects the hooking DLL, and resumes it cleanly.
   - `attach`: Attaches to an existing process owned by the current user session and injects the proxy hook.

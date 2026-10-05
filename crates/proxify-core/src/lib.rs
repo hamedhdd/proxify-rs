@@ -37,6 +37,12 @@ fn default_true() -> bool {
 pub struct ProxyConfig {
     pub proxy_host: String,
     pub proxy_port: u16,
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+    #[serde(default)]
+    pub theme: Option<String>,
     #[serde(default = "default_action_direct")]
     pub default_action: RuleAction,
     #[serde(default)]
@@ -54,6 +60,9 @@ impl Default for ProxyConfig {
         Self {
             proxy_host: "127.0.0.1".to_string(),
             proxy_port: 1080,
+            proxy_username: None,
+            proxy_password: None,
+            theme: Some("dark".to_string()),
             default_action: RuleAction::Direct,
             rules: vec![
                 Rule {
@@ -148,6 +157,7 @@ pub mod socks5 {
 
     pub const SOCKS_VERSION: u8 = 0x05;
     pub const AUTH_NONE: u8 = 0x00;
+    pub const AUTH_USER_PASS: u8 = 0x02;
     pub const CMD_CONNECT: u8 = 0x01;
     pub const ATYP_IPV4: u8 = 0x01;
     pub const ATYP_DOMAIN: u8 = 0x03;
@@ -159,7 +169,34 @@ pub mod socks5 {
         [SOCKS_VERSION, 0x01, AUTH_NONE]
     }
 
-    /// Verify SOCKS5 greeting response: [VER=0x05, METHOD=0x00]
+    /// Build SOCKS5 greeting packet with optional username/password support.
+    pub fn build_greeting_methods(has_credentials: bool) -> Vec<u8> {
+        if has_credentials {
+            vec![SOCKS_VERSION, 0x02, AUTH_NONE, AUTH_USER_PASS]
+        } else {
+            vec![SOCKS_VERSION, 0x01, AUTH_NONE]
+        }
+    }
+
+    /// Build RFC 1929 Username/Password auth request: [0x01, ulen, user..., plen, pass...]
+    pub fn build_auth_request(user: &str, pass: &str) -> Vec<u8> {
+        let u_bytes = user.as_bytes();
+        let p_bytes = pass.as_bytes();
+        let mut buf = Vec::with_capacity(3 + u_bytes.len() + p_bytes.len());
+        buf.push(0x01); // Auth subnegotiation version
+        buf.push(u_bytes.len() as u8);
+        buf.extend_from_slice(u_bytes);
+        buf.push(p_bytes.len() as u8);
+        buf.extend_from_slice(p_bytes);
+        buf
+    }
+
+    /// Verify RFC 1929 Auth response: [0x01, 0x00]
+    pub fn verify_auth_response(response: &[u8]) -> bool {
+        response.len() >= 2 && response[1] == 0x00
+    }
+
+    /// Verify SOCKS5 greeting response: [VER=0x05, METHOD]
     pub fn verify_greeting_response(response: &[u8]) -> bool {
         response.len() >= 2 && response[0] == SOCKS_VERSION && response[1] == AUTH_NONE
     }
